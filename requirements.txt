@@ -1,0 +1,9 @@
+feedparser
+matplotlib
+numpy
+openai
+requests
+streamlit
+yfinance
+youtube-transcript-api
+yt-dlp
