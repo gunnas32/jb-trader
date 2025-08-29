@@ -3,11 +3,11 @@
 #
 # Justin Bennett / Daily Price Action video analyzer:
 # - Pulls latest YouTube videos via RSS.
-# - Gets transcript (captions first; OpenAI Whisper fallback).
+# - Gets transcript (captions first; Whisper fallback with yt-dlp + optional cookies).
 # - Uses OpenAI to create a SHORT SUMMARY + STRUCTURED TRADE IDEA (strict JSON).
 # - Stores everything in SQLite (remembers what’s analyzed; only processes new).
 # - Synthesizes an updated overall plan using recent context.
-# - NEW: Live prices per instrument + crisp trade cards with Entry / SL / TPs.
+# - Live prices per instrument, crisp trade cards with Entry / SL / TPs.
 #
 # ⚠ INFO/EDU ONLY — NOT FINANCIAL ADVICE.
 import os, re, json, sqlite3, tempfile, datetime as dt, threading
@@ -203,19 +203,36 @@ def _lazy_import_ytdlp():
         import yt_dlp as _YTDLP  # lazy import
     return _YTDLP
 
-def fetch_audio_and_transcribe_openai(video_url: str, client: "OpenAI") -> Tuple[Optional[str], Optional[str]]:
+def fetch_audio_and_transcribe_openai(video_url: str, client: "OpenAI", cookies_bytes: Optional[bytes] = None) -> Tuple[Optional[str], Optional[str]]:
     """Download audio with yt-dlp → transcribe via OpenAI (4o-mini-transcribe or whisper-1)."""
     try:
         ydlp = _lazy_import_ytdlp()
         tmpdir = tempfile.mkdtemp(prefix="jb_audio_")
         outpath = os.path.join(tmpdir, "%(id)s.%(ext)s")
+        cookiefile = None
+        if cookies_bytes:
+            cookiefile = os.path.join(tmpdir, "cookies.txt")
+            with open(cookiefile, "wb") as cf:
+                cf.write(cookies_bytes)
+
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': outpath,
             'quiet': True,
             'noprogress': True,
             'nocheckcertificate': True,
+            'geo_bypass': True,
+            'geo_bypass_country': 'US',
+            # try different player client to dodge 403/age/region issues
+            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9'
+            },
         }
+        if cookiefile:
+            ydl_opts['cookiefile'] = cookiefile
+
         with ydlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
             filepath = ydl.prepare_filename(info)
@@ -290,7 +307,6 @@ def analyze_one_video(client: "OpenAI", model_name: str, title: str, transcript:
         c = f"- {row['title']}: {row.get('summary','')}"
         try:
             idea = json.loads(row.get("idea_json") or "{}")
-            # show compact summary of past trade_ideas if present
             ideas = idea.get("trade_ideas") or ([idea.get("trade_idea")] if idea.get("trade_idea") else [])
             if ideas:
                 for it in ideas[:2]:
@@ -376,7 +392,6 @@ def _candidates_for_instrument(inst: str) -> List[str]:
         cands.append(f"{inst}=X")
     # Crypto
     if inst.endswith("USD") and len(inst) in (6,7):
-        # e.g. BTCUSD -> BTC-USD, ETHUSD -> ETH-USD
         cands.append(f"{inst[:-3]}-USD")
     # DXY
     if inst in ("DXY", "USDIDX", "USDX"):
@@ -387,9 +402,9 @@ def _candidates_for_instrument(inst: str) -> List[str]:
     # S&P 500
     if inst in ("SPX","SPY","S&P500","GSPC"):
         cands.extend(["^GSPC","SPY"])
-    # Fallback: raw symbol
+    # Fallback
     cands.append(inst)
-    return list(dict.fromkeys(cands))  # unique, keep order
+    return list(dict.fromkeys(cands))
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_live_price(inst: str) -> Tuple[Optional[float], Optional[str]]:
@@ -397,11 +412,9 @@ def get_live_price(inst: str) -> Tuple[Optional[float], Optional[str]]:
     for t in _candidates_for_instrument(inst):
         try:
             ti = yf.Ticker(t)
-            # fast_info often works
             fi = getattr(ti, "fast_info", None)
             if fi and getattr(fi, "last_price", None):
                 return float(fi.last_price), t
-            # fallback: last close/last 1m candle
             hist = ti.history(period="1d", interval="1m")
             if not hist.empty:
                 return float(hist["Close"].iloc[-1]), t
@@ -413,7 +426,6 @@ def get_live_price(inst: str) -> Tuple[Optional[float], Optional[str]]:
     return None, None
 
 def _normalize_trade_ideas(idea: Dict) -> List[Dict]:
-    """Support both new trade_ideas[] and old trade_idea{}."""
     if not isinstance(idea, dict): return []
     if isinstance(idea.get("trade_ideas"), list):
         return [x for x in idea["trade_ideas"] if isinstance(x, dict)]
@@ -479,7 +491,7 @@ def render_trade_cards(idea: Dict, title: str = "", where: str = "Video"):
         st.divider()
 
 # ---------- Analysis orchestrators ----------
-def analyze_workflow(channel_id: str, model_name: str, first_run_take: int = 3):
+def analyze_workflow(channel_id: str, model_name: str, fallback_enabled: bool = True, cookies_bytes: Optional[bytes] = None, first_run_take: int = 3):
     conn = get_db()
     client = get_openai_client()
     if not client:
@@ -513,15 +525,17 @@ def analyze_workflow(channel_id: str, model_name: str, first_run_take: int = 3):
         st.write(f"#### Video {i}/{len(targets)} — {v['title']}")
         with st.status("Transcribing…", expanded=False) as status:
             text, err = fetch_transcript_youtube(v["video_id"])
-            if not text:
+            if not text and fallback_enabled:
                 status.update(label="Captions not available. Trying Whisper fallback…", state="running")
-                text2, err2 = (None, "OpenAI not configured")
-                if client:
-                    text2, err2 = fetch_audio_and_transcribe_openai(v["url"], client)
-                text = text2
-                err = err2
+                text2, err2 = fetch_audio_and_transcribe_openai(v["url"], client, cookies_bytes=cookies_bytes)
+                text, err = text2, err2
+
             if not text:
-                status.update(label=f"❌ Couldn’t get transcript ({err}). Skipping.", state="error")
+                reason = f"({err})" if err else "(no transcript)"
+                if not fallback_enabled:
+                    status.update(label=f"No captions; Whisper fallback disabled. Skipping. {reason}", state="error")
+                else:
+                    status.update(label=f"❌ Couldn’t get transcript {reason}. Skipping.", state="error")
                 save_video_row(conn, {
                     "video_id": v["video_id"], "channel_id": channel_id, "published": v["published"],
                     "title": v["title"], "url": v["url"], "transcript": None, "summary": None,
@@ -542,7 +556,7 @@ def analyze_workflow(channel_id: str, model_name: str, first_run_take: int = 3):
                 status.update(label="✅ Done", state="complete")
                 st.success(summary)
 
-                # Render trade cards (friendly) + show raw JSON (toggle)
+                # Render trade cards + raw JSON
                 try:
                     idea = json.loads(idea_json)
                     render_trade_cards(idea, title=v["title"], where="Video")
@@ -595,6 +609,27 @@ def main():
     current_model = st.sidebar.text_input("OpenAI model", value=st.session_state["current_model"], help="e.g., gpt-4o-mini")
     st.session_state["current_model"] = current_model
 
+    # Transcription options
+    st.sidebar.subheader("Transcription options")
+    fallback_enabled = st.sidebar.checkbox(
+        "Try Whisper fallback if captions missing",
+        value=True,
+        help="Downloads audio via yt-dlp and transcribes with OpenAI. If you see 403, add cookies below."
+    )
+
+    cookies_bytes = None
+    cookies_secret = st.secrets.get("YTDLP_COOKIES", None)
+    if cookies_secret:
+        cookies_bytes = cookies_secret.encode("utf-8")
+
+    cookie_file = st.sidebar.file_uploader(
+        "YouTube cookies.txt (optional)",
+        type=["txt"],
+        help="Export with a browser extension (Netscape format). Helps bypass 403/age/region limits."
+    )
+    if cookie_file:
+        cookies_bytes = cookie_file.read()
+
     api_present = bool(pick_env("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None))
     st.sidebar.write(f"OpenAI Key: {'✅ set' if api_present else '❌ missing'}")
     st.sidebar.write(f"DB file: `{DB_PATH}`")
@@ -637,7 +672,7 @@ def main():
     col1, col2 = st.columns([1,1])
     with col1:
         if st.button("▶ Run analysis now", type="primary"):
-            analyze_workflow(channel_id, current_model)
+            analyze_workflow(channel_id, current_model, fallback_enabled, cookies_bytes)
     with col2:
         if st.button("♻ Rebuild overall idea (no new videos)"):
             client = get_openai_client()
