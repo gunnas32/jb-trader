@@ -1,9 +1,6 @@
-feedparser
-matplotlib
-numpy
-openai
-requests
 streamlit
-yfinance
-youtube-transcript-api
+feedparser
+openai
 yt-dlp
+yfinance
+plotly
