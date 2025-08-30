@@ -1,61 +1,40 @@
 # justin_bennett_trader.py
-# requirements: streamlit, feedparser, youtube-transcript-api, openai, yt-dlp, requests, yfinance
+# requirements: streamlit, feedparser, openai, yt-dlp, yfinance
 #
-# Justin Bennett / Daily Price Action video analyzer:
-# - Pulls latest YouTube videos via RSS.
-# - Transcript order:
-#     (A) YouTube captions
-#     (B) AssemblyAI (URL-based; no cookies needed)
-#     (C) Whisper via yt-dlp (+ optional cookies)
-# - PLUS Whisper-only modes:
-#     (D) Whisper via Relay (recommended on Cloud)
-#     (E) Whisper via Manual Upload (bullet-proof)
-# - Uses OpenAI to create a SHORT SUMMARY + STRUCTURED TRADE IDEA (strict JSON).
-# - Stores history in SQLite (remembers analyzed items).
-# - Synthesizes an updated overall plan from recent videos.
-# - Live prices via yfinance, clean trade cards (Entries / SL / TPs).
-# - Top “☰ Menu” navigation + Maintenance page (soft wipe / hard reset).
+# Whisper-only version:
+# - Fetches Justin Bennett channel feed.
+# - Downloads audio with yt-dlp (uses cookies if provided).
+# - Transcribes ONLY with OpenAI Whisper (whisper-1).
+# - If download/transcription fails (e.g., 403/age/region), it PROMPTS for a Netscape cookies.txt upload.
+# - After uploading cookies, click "Retry now" to re-run. The same run will then work with cookies.
+# - Stores analyses in SQLite; synthesizes an overall plan; shows live prices on trade cards.
 #
-# ⚠️ Educational use only — not financial advice.
+# ⚠️ Informational only — not financial advice.
 
 import os, re, json, sqlite3, tempfile, datetime as dt, threading, time
 from typing import List, Dict, Optional, Tuple
 
-import requests
 import streamlit as st
 import feedparser
-from youtube_transcript_api import (
-    YouTubeTranscriptApi,
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    CouldNotRetrieveTranscript,
-)
+from openai import OpenAI
+import yfinance as yf
 
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+# ----------------- Basic App Info -----------------
+APP_NAME = "Justin Bennett — Whisper-Only Analyzer"
+DEFAULT_CHANNEL_ID = "UCaWQprRy3TgktPvsyBLUNxw"   # Daily Price Action
 
-import yfinance as yf  # live prices
-
-_YTDLP = None
-
-APP_NAME = "Justin Bennett — Video Trading Tool"
-DEFAULT_CHANNEL_ID = "UCaWQprRy3TgktPvsyBLUNxw"   # Daily Price Action (@JustinBennettfx)
-
-# --------- Paths / DB ---------
 BASE_DIR = os.path.dirname(__file__)
-DB_DIR = os.path.abspath(os.path.join(BASE_DIR, "data"))   # keep DB in repo folder
+DB_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "jb_trader.db")
 
 DB_LOCK = threading.Lock()
 FEED_URL_TMPL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 
-# Default analysis model (can be overridden in sidebar)
+# Model for analysis (NOT transcription). You can change this in the sidebar.
 DEFAULT_MODEL = os.getenv("JB_OPENAI_MODEL", "gpt-4o-mini")
 
-# --------- Utilities ---------
+# ----------------- Utilities -----------------
 def now_utc() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
@@ -63,10 +42,16 @@ def clamp_text(s: str, max_chars: int) -> str:
     s = s or ""
     return s if len(s) <= max_chars else (s[:max_chars] + "\n\n[...truncated...]")
 
-def pick_env(name: str) -> Optional[str]:
-    v = os.getenv(name)
-    return v.strip() if (v and v.strip()) else None
+def get_openai_client() -> Optional[OpenAI]:
+    key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+    if not key:
+        return None
+    try:
+        return OpenAI(api_key=key)
+    except Exception:
+        return None
 
+# ----------------- DB -----------------
 def ensure_db(conn: sqlite3.Connection):
     cur = conn.cursor()
     cur.execute("""
@@ -97,32 +82,11 @@ def ensure_db(conn: sqlite3.Connection):
 
 @st.cache_resource(show_spinner=False)
 def get_db():
-    # Allow cross-thread use; WAL improves concurrency
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     ensure_db(conn)
     return conn
-
-def feed_latest(channel_id: str, limit: int = 10) -> List[Dict]:
-    url = FEED_URL_TMPL.format(channel_id=channel_id)
-    d = feedparser.parse(url)
-    items = []
-    for e in d.entries[:limit]:
-        vid = e.get("yt_videoid") or (e.get("id","").split(":")[-1])
-        items.append({
-            "video_id": vid,
-            "title": (e.get("title") or "").strip(),
-            "published": e.get("published",""),
-            "url": e.get("link",""),
-        })
-    items.sort(key=lambda x: x.get("published",""), reverse=True)
-    return items
-
-def get_known_ids(conn, channel_id: str) -> set:
-    cur = conn.cursor()
-    cur.execute("SELECT video_id FROM videos WHERE channel_id=?", (channel_id,))
-    return {r[0] for r in cur.fetchall()}
 
 def save_video_row(conn, row: Dict):
     with DB_LOCK:
@@ -215,61 +179,62 @@ def list_snapshots(conn, channel_id: str, limit: int = 10) -> List[Dict]:
         })
     return out
 
-# --- Maintenance helpers ---
 def wipe_db_tables():
-    """Soft reset: keep the file, delete all rows."""
     conn = get_db()
     with DB_LOCK:
         conn.execute("DELETE FROM videos;")
         conn.execute("DELETE FROM snapshots;")
         conn.commit()
 
-def hard_reset_db_file():
-    """Hard reset: close cached conn, delete the DB file, recreate on next use."""
+def nuke_everything():
     try:
         conn = get_db()
         conn.close()
-    except Exception:
-        pass
+    except: pass
     st.cache_resource.clear()
     try:
         if os.path.exists(DB_PATH):
             os.remove(DB_PATH)
     except Exception as e:
         st.warning(f"Could not delete DB file: {e}")
-
-def nuke_everything():
-    """Delete DB + clear caches + clear session, then rerun fresh."""
-    hard_reset_db_file()
     st.cache_data.clear()
     st.session_state.clear()
     st.success("All data and caches cleared. Rerunning…")
     st.rerun()
 
-# ---------- Transcript helpers ----------
-def fetch_transcript_youtube(video_id: str) -> Tuple[Optional[str], Optional[str]]:
-    try:
-        caps = YouTubeTranscriptApi.get_transcript(video_id, languages=['en','en-US','en-GB'])
-        text = " ".join([c.get("text","") for c in caps])
-        text = re.sub(r"\s+", " ", text).strip()
-        return (text, None) if text else (None, "Empty transcript")
-    except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
-        return None, f"No captions: {e}"
-    except Exception as e:
-        return None, f"Transcript error: {e}"
+# ----------------- Feed -----------------
+def feed_latest(channel_id: str, limit: int = 10) -> List[Dict]:
+    url = FEED_URL_TMPL.format(channel_id=channel_id)
+    d = feedparser.parse(url)
+    items = []
+    for e in d.entries[:limit]:
+        vid = e.get("yt_videoid") or (e.get("id","").split(":")[-1])
+        items.append({
+            "video_id": vid,
+            "title": (e.get("title") or "").strip(),
+            "published": e.get("published",""),
+            "url": e.get("link",""),
+        })
+    items.sort(key=lambda x: x.get("published",""), reverse=True)
+    return items
 
+# ----------------- Whisper-only transcription -----------------
+_YTDLP = None
 def _lazy_import_ytdlp():
     global _YTDLP
     if _YTDLP is None:
         import yt_dlp as _YTDLP  # lazy import
     return _YTDLP
 
-def fetch_audio_and_transcribe_openai(video_url: str, client: "OpenAI", cookies_bytes: Optional[bytes] = None) -> Tuple[Optional[str], Optional[str]]:
-    """Download audio with yt-dlp → transcribe via OpenAI (4o-mini-transcribe or whisper-1)."""
+def transcribe_with_whisper(video_url: str, client: OpenAI, cookies_bytes: Optional[bytes] = None) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Download audio with yt-dlp (optionally with cookies) then send to OpenAI whisper-1.
+    Returns (text, error).
+    """
     try:
         ydlp = _lazy_import_ytdlp()
         tmpdir = tempfile.mkdtemp(prefix="jb_audio_")
-        outpath = os.path.join(tmpdir, "%(id)s.%(ext)s")
+        outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
         cookiefile = None
         if cookies_bytes:
             cookiefile = os.path.join(tmpdir, "cookies.txt")
@@ -277,21 +242,21 @@ def fetch_audio_and_transcribe_openai(video_url: str, client: "OpenAI", cookies_
                 cf.write(cookies_bytes)
 
         ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': outpath,
-            'quiet': True,
-            'noprogress': True,
-            'nocheckcertificate': True,
-            'geo_bypass': True,
-            'geo_bypass_country': 'US',
-            # player client & headers to dodge 403/age/region issues
-            'extractor_args': {'youtube': {'player_client': ['android', 'web']}}},
-        ydl_opts['http_headers'] = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9'
+            "format": "bestaudio/best",
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "noprogress": True,
+            "nocheckcertificate": True,
+            "geo_bypass": True,
+            "geo_bypass_country": "US",
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         }
         if cookiefile:
-            ydl_opts['cookiefile'] = cookiefile
+            ydl_opts["cookiefile"] = cookiefile
 
         with ydlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
@@ -299,15 +264,11 @@ def fetch_audio_and_transcribe_openai(video_url: str, client: "OpenAI", cookies_
 
         try:
             with open(filepath, "rb") as f:
-                try:
-                    r = client.audio.transcriptions.create(model="gpt-4o-mini-transcribe", file=f)
-                    text = r.text
-                except Exception:
-                    f.seek(0)
-                    r = client.audio.transcriptions.create(model="whisper-1", file=f)
-                    text = r.text
-            text = re.sub(r"\s+", " ", (text or "")).strip()
-            return (text, None) if text else (None, "OpenAI returned empty transcript")
+                r = client.audio.transcriptions.create(model="whisper-1", file=f)
+                text = (r.text or "").strip()
+            if not text:
+                return None, "Whisper returned empty text"
+            return text, None
         finally:
             try:
                 for fn in os.listdir(tmpdir):
@@ -316,85 +277,9 @@ def fetch_audio_and_transcribe_openai(video_url: str, client: "OpenAI", cookies_
                 os.rmdir(tmpdir)
             except: pass
     except Exception as e:
-        return None, f"Fallback transcription failed: {e}"
+        return None, f"Whisper download/transcription failed: {e}"
 
-def transcribe_via_assemblyai(video_url: str, api_key: str, poll_s: float = 3.0, timeout_s: int = 600) -> Tuple[Optional[str], Optional[str]]:
-    """Ask AssemblyAI to fetch & transcribe the YouTube URL. Returns (text, error)."""
-    try:
-        headers = {"authorization": api_key, "content-type": "application/json"}
-        r = requests.post(
-            "https://api.assemblyai.com/v2/transcript",
-            json={"audio_url": video_url, "language_code": "en"},
-            headers=headers, timeout=30,
-        )
-        r.raise_for_status()
-        tid = r.json()["id"]
-
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            s = requests.get(f"https://api.assemblyai.com/v2/transcript/{tid}", headers=headers, timeout=30)
-            s.raise_for_status()
-            data = s.json()
-            status = data.get("status")
-            if status == "completed":
-                text = (data.get("text") or "").strip()
-                return (text if text else None, None)
-            if status == "error":
-                return None, f"AssemblyAI error: {data.get('error')}"
-            time.sleep(poll_s)
-        return None, "AssemblyAI timeout"
-    except Exception as e:
-        return None, f"AssemblyAI exception: {e}"
-
-# --- Whisper-only helpers (Relay + Manual Upload) ---
-def fetch_audio_via_relay(video_url: str, relay_url: str, cookies_text: Optional[str] = None) -> Tuple[Optional[bytes], Optional[str]]:
-    """
-    Ask the external relay to fetch audio for a YouTube URL and return raw bytes.
-    relay_url should be like: https://your-relay.onrender.com
-    """
-    try:
-        url = relay_url.rstrip("/") + "/fetch"
-        payload = {"url": video_url}
-        if cookies_text:
-            payload["cookies"] = cookies_text
-        r = requests.post(url, json=payload, timeout=180)
-        if r.status_code != 200:
-            return None, f"Relay HTTP {r.status_code}: {r.text[:200]}"
-        return r.content, None
-    except Exception as e:
-        return None, f"Relay exception: {e}"
-
-def transcribe_bytes_via_whisper(data_bytes: bytes, client: "OpenAI", filename_hint: str = "audio.webm") -> Tuple[Optional[str], Optional[str]]:
-    """Send raw audio/video bytes to OpenAI Whisper."""
-    try:
-        suffix = os.path.splitext(filename_hint)[1] or ".webm"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(data_bytes)
-            tmp.flush()
-            tmp_path = tmp.name
-        try:
-            with open(tmp_path, "rb") as f:
-                resp = client.audio.transcriptions.create(model="whisper-1", file=f)
-            text = (resp.text or "").strip()
-            return (text if text else None, None)
-        finally:
-            try: os.remove(tmp_path)
-            except: pass
-    except Exception as e:
-        return None, f"Whisper bytes transcription failed: {e}"
-
-# ---------- OpenAI ----------
-def get_openai_client() -> Optional["OpenAI"]:
-    key = pick_env("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
-    if not key or OpenAI is None:
-        return None
-    try:
-        client = OpenAI(api_key=key)
-        return client
-    except Exception:
-        return None
-
-# ---------- Model prompts ----------
+# ----------------- Analysis prompts -----------------
 SYSTEM_PROMPT = """You are a trading analyst specialized in summarizing Justin Bennett (Daily Price Action) videos.
 Extract price-action ideas without hype. Prefer clarity over verbosity.
 
@@ -403,55 +288,36 @@ Return STRICT JSON with these fields:
 - instruments: array of symbols he discussed (e.g., ["DXY","EURUSD","GBPUSD","USDJPY","XAUUSD"]).
 - key_levels: array of {instrument, level, type, note} where type ∈ {"support","resistance","trendline","range","fibo","other"}.
 - directional_bias: object mapping instrument -> {"bullish","bearish","neutral"} (only for instruments he mentioned).
-- trade_ideas: array of objects (1–3 max). Each item:
+- trade_ideas: array of 1–3 objects:
   {
     instrument: "EURUSD",
     timeframe: "Daily",
     bias: "bullish" | "bearish" | "neutral",
-    plan: "one-line plan plain English",
-    entries: [
-      { type: "breakout" | "retest" | "limit", level: "1.0800", condition: "daily close above then retest as support" }
-    ],
-    stop_loss: { level: "1.0740", rationale: "below swing low / invalidates structure" },
-    take_profits: [
-      { level: "1.0890", label: "TP1" },
-      { level: "1.1000", label: "TP2" }
-    ],
-    risk_notes: ["trade what you see", "no numeric levels stated" if missing]
+    plan: "one-line plan",
+    entries: [{ type: "breakout"|"retest"|"limit", level: "1.0800", condition: "..." }],
+    stop_loss: { level: "1.0740", rationale: "..." },
+    take_profits: [{ level: "1.0890", label: "TP1" }, { level: "1.1000", label: "TP2" }],
+    risk_notes: ["no numeric levels stated" if missing]
   }
-
-If the transcript lacks numbers, put "no numeric levels stated" in the relevant fields (do NOT invent prices).
-Also include a top-level `confidence` number 0..1 and `assumptions` (short bullet list).
-If you only find one valid opportunity, return a single-element trade_ideas array.
+Include top-level fields: confidence (0..1), assumptions (bullets).
+If the transcript lacks numbers, do not invent prices.
 """
 
-def analyze_one_video(client: "OpenAI", model_name: str, title: str, transcript: str, previous_context: List[Dict]) -> Tuple[str, str]:
-    """Returns (short_summary, idea_json_str)."""
+def analyze_one_video(client: OpenAI, model_name: str, title: str, transcript: str, previous_context: List[Dict]) -> Tuple[str, str]:
     ctx_snips = []
     for row in previous_context[-8:]:
         c = f"- {row['title']}: {row.get('summary','')}"
         try:
             idea = json.loads(row.get("idea_json") or "{}")
             ideas = idea.get("trade_ideas") or ([idea.get("trade_idea")] if idea.get("trade_idea") else [])
-            if ideas:
-                for it in ideas[:2]:
-                    if not it: continue
-                    c += f"\n  {it.get('instrument','?')} • {it.get('bias','?')} • plan: {it.get('plan','')[:60]}"
+            for it in (ideas or [])[:2]:
+                if not it: continue
+                c += f"\n  {it.get('instrument','?')} • {it.get('bias','?')} • plan: {it.get('plan','')[:60]}"
         except Exception:
             pass
         ctx_snips.append(c)
 
-    user_prompt = f"""
-CONTEXT (previous videos, recent first):
-{os.linesep.join(ctx_snips) if ctx_snips else "none"}
-
-VIDEO TITLE:
-{title}
-
-TRANSCRIPT (truncated if long):
-{clamp_text(transcript, 18000)}
-"""
-
+    user_prompt = f"CONTEXT:\n{os.linesep.join(ctx_snips) if ctx_snips else 'none'}\n\nTITLE:\n{title}\n\nTRANSCRIPT:\n{clamp_text(transcript, 18000)}"
     resp = client.chat.completions.create(
         model=model_name,
         messages=[{"role":"system","content":SYSTEM_PROMPT},
@@ -459,55 +325,15 @@ TRANSCRIPT (truncated if long):
         temperature=0.2,
     )
     content = resp.choices[0].message.content
-
     try:
         idea_json = json.loads(content)
     except Exception:
         m = re.search(r"\{.*\}", content, re.S)
-        idea_json = json.loads(m.group(0)) if m else None
-    if not isinstance(idea_json, dict):
-        raise RuntimeError("Model did not return valid JSON.")
-
+        idea_json = json.loads(m.group(0)) if m else {}
     short_summary = idea_json.get("short_summary", "")
     return short_summary, json.dumps(idea_json, ensure_ascii=False)
 
-def synthesize_overall(client: "OpenAI", model_name: str, recent_rows: List[Dict], new_rows: List[Dict]) -> Tuple[str, str]:
-    """Combine last ~10 analyses to produce an updated plan (same JSON schema)."""
-    ctx = []
-    merged = (new_rows + [x for x in recent_rows if x not in new_rows])[:10]
-    for r in merged:
-        try:
-            idea = json.loads(r.get("idea_json") or "{}")
-        except Exception:
-            idea = {}
-        ctx.append({
-            "title": r.get("title",""),
-            "published": r.get("published",""),
-            "summary": r.get("summary",""),
-            "idea": idea
-        })
-    prompt = "Past & new analyses to consider:\n" + json.dumps(ctx, ensure_ascii=False) + \
-             "\n\nSynthesize an UPDATED plan that reconciles conflicts. Return strict JSON using the same schema (with `trade_ideas`)."
-
-    resp = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role":"system","content":SYSTEM_PROMPT},
-                  {"role":"user","content":prompt}],
-        temperature=0.2,
-    )
-    content = resp.choices[0].message.content
-
-    try:
-        data = json.loads(content)
-    except Exception:
-        m = re.search(r"\{.*\}", content, re.S)
-        data = json.loads(m.group(0)) if m else None
-    if not isinstance(data, dict):
-        raise RuntimeError("Synthesis returned invalid JSON.")
-
-    return data.get("short_summary",""), json.dumps(data, ensure_ascii=False)
-
-# ---------- Live prices ----------
+# ----------------- Live prices -----------------
 def _candidates_for_instrument(inst: str) -> List[str]:
     inst = (inst or "").upper().replace("/", "")
     cands = []
@@ -549,70 +375,52 @@ def _normalize_trade_ideas(idea: Dict) -> List[Dict]:
     ti = idea.get("trade_idea")
     return [ti] if isinstance(ti, dict) else []
 
-def _pretty_levels(level) -> str:
-    if level is None: return "—"
-    if isinstance(level, (int, float)):
-        return f"{level:.5f}".rstrip("0").rstrip(".")
-    return str(level)
+def _fmt_level(x):
+    if x is None: return "—"
+    if isinstance(x, (int,float)): return f"{x:.5f}".rstrip("0").rstrip(".")
+    return str(x)
 
-def render_trade_cards(idea: Dict, title: str = "", where: str = "Video"):
+def render_trade_cards(idea: Dict, where: str = "Video"):
     trades = _normalize_trade_ideas(idea)
     if not trades:
-        st.info("No structured trade ideas found in this item.")
+        st.info("No structured trade ideas found.")
         return
-
-    for i, tr in enumerate(trades, start=1):
+    for i, tr in enumerate(trades, 1):
         instrument = (tr.get("instrument") or "").upper()
-        bias = tr.get("bias") or idea.get("directional_bias", {}).get(instrument, "")
-        plan = tr.get("plan") or ""
-        timeframe = tr.get("timeframe") or idea.get("timeframe", "")
-        entries = tr.get("entries") or []
-        sl = tr.get("stop_loss") or {}
-        tps = tr.get("take_profits") or []
-
         price, used = (None, None)
-        if instrument:
-            price, used = get_live_price(instrument)
-
-        box = st.container(border=True)
-        with box:
-            hdr = f"**{where} Trade {i} — {instrument}**"
-            if price is not None:
-                hdr += f"  |  Live: `{_pretty_levels(price)}` ({used})"
+        if instrument: price, used = get_live_price(instrument)
+        with st.container(border=True):
+            hdr = f"**{where} Trade {i} — {instrument or '—'}**"
+            if price is not None: hdr += f"  |  Live: `{_fmt_level(price)}` ({used})"
             st.markdown(hdr)
-            cols = st.columns([1.2, 2.2, 1.2])
-            with cols[0]:
-                st.markdown(f"**Bias:** {bias or '—'}")
-                st.markdown(f"**TF:** {timeframe or '—'}")
-            with cols[1]:
-                st.markdown(f"**Plan:** {plan or '—'}")
-                if entries:
-                    st.markdown("**Entries:**")
-                    for e in entries:
-                        st.markdown(f"- {e.get('type','entry')}: `{_pretty_levels(e.get('level'))}` — {e.get('condition','')}")
-            with cols[2]:
+            c1, c2, c3 = st.columns([1.1, 2.2, 1.2])
+            with c1:
+                st.markdown(f"**Bias:** {tr.get('bias','—')}")
+                st.markdown(f"**TF:** {tr.get('timeframe','—')}")
+            with c2:
+                st.markdown(f"**Plan:** {tr.get('plan','—')}")
+                for e in tr.get("entries", []) or []:
+                    st.markdown(f"- {e.get('type','entry')} @ `{_fmt_level(e.get('level'))}` — {e.get('condition','')}")
+            with c3:
+                sl = tr.get("stop_loss") or {}
+                tps = tr.get("take_profits") or []
                 st.markdown("**Stop Loss:**")
-                if sl:
-                    st.markdown(f"- SL: `{_pretty_levels(sl.get('level'))}`")
-                    if sl.get("rationale"): st.caption(sl["rationale"])
-                else:
-                    st.markdown("—")
-                st.markdown("**Take Profits:**")
+                st.markdown(f"- `{_fmt_level(sl.get('level'))}`" if sl else "—")
+                st.markdown("**TPs:**")
                 if tps:
                     for t in tps:
-                        lbl = t.get("label","TP")
-                        st.markdown(f"- {lbl}: `{_pretty_levels(t.get('level'))}`")
+                        st.markdown(f"- {t.get('label','TP')}: `{_fmt_level(t.get('level'))}`")
                 else:
                     st.markdown("—")
-        st.caption("Risk: position sizing, slippage, news risk. Not financial advice.")
+        st.caption("Not financial advice.")
         st.divider()
 
-# ---------- Analysis orchestrator ----------
-def analyze_workflow(channel_id: str, model_name: str, fallback_enabled: bool = True, cookies_bytes: Optional[bytes] = None, first_run_take: int = 3, audio_mode: str = "Auto (Captions → AssemblyAI → Whisper)", relay_url: Optional[str] = None):
+# ----------------- Workflow -----------------
+def analyze_workflow(channel_id: str, model_name: str, cookies_bytes: Optional[bytes] = None, first_run_take: int = 3):
     conn = get_db()
     client = get_openai_client()
     if not client:
-        st.error("OpenAI client not available. Set OPENAI_API_KEY via environment or .streamlit/secrets.toml")
+        st.error("OpenAI client not available. Add OPENAI_API_KEY in secrets.")
         return
 
     st.write("### 1) Checking channel feed…")
@@ -621,76 +429,68 @@ def analyze_workflow(channel_id: str, model_name: str, fallback_enabled: bool = 
         st.warning("No items found on the channel feed.")
         return
 
-    known = get_known_ids(conn, channel_id)
-    unseen = [v for v in feed if v["video_id"] not in known]
-
-    if len(known) == 0:
-        targets = feed[:first_run_take]
+    # Determine: first run = process last N; otherwise only unseen
+    known_ids = {r["video_id"] for r in list_all_analyses(conn, channel_id)}
+    targets = feed[:first_run_take] if not known_ids else [v for v in feed if v["video_id"] not in known_ids]
+    if not known_ids:
         st.info(f"First run: analyzing the last {len(targets)} videos.")
+    elif targets:
+        st.info(f"Found {len(targets)} new video(s).")
     else:
-        targets = unseen
-        if targets:
-            st.info(f"Found {len(targets)} new video(s). Analyzing…")
-        else:
-            st.success("No new videos. Will still synthesize an updated plan from recent context.")
+        st.success("No new videos found. Will still synthesize an updated plan from recent context.")
     st.divider()
 
     recent_rows = list_recent_analyses(conn, channel_id, limit=10)
     analyzed_rows = []
 
-    for i, v in enumerate(targets, start=1):
+    for i, v in enumerate(targets, 1):
         st.write(f"#### Video {i}/{len(targets)} — {v['title']}")
-        with st.status("Transcribing…", expanded=False) as status:
-            # Determine cookies text if needed
-            cookies_text = None
-            if cookies_bytes:
-                try: cookies_text = cookies_bytes.decode("utf-8", errors="ignore")
-                except: cookies_text = None
-            if not cookies_text:
-                cookies_text = st.secrets.get("YTDLP_COOKIES", None)
+        with st.status("Transcribing with Whisper…", expanded=False) as status:
+            text, err = transcribe_with_whisper(v["url"], client, cookies_bytes=cookies_bytes)
 
-            # --- Whisper via Relay (skip captions/AAI entirely) ---
-            if audio_mode == "Whisper via Relay (recommended on Cloud)":
-                if not relay_url:
-                    status.update(label="Relay URL missing. Set it in the sidebar.", state="error")
-                    text, err = None, "Relay URL missing"
-                else:
-                    status.update(label="Fetching audio via Relay…", state="running")
-                    audio_bytes, relay_err = fetch_audio_via_relay(v["url"], relay_url, cookies_text)
-                    if audio_bytes:
-                        status.update(label="Transcribing with Whisper…", state="running")
-                        text, err = transcribe_bytes_via_whisper(audio_bytes, get_openai_client(), filename_hint="audio.webm")
-                    else:
-                        text, err = None, relay_err
-
-            # --- Auto: Captions → AssemblyAI → Whisper(yt-dlp) ---
-            else:
-                text, err = fetch_transcript_youtube(v["video_id"])
-                if not text and fallback_enabled:
-                    aai_key = (st.secrets.get("ASSEMBLYAI_API_KEY", None) or os.getenv("ASSEMBLYAI_API_KEY"))
-                    if aai_key:
-                        status.update(label="Captions missing. Trying AssemblyAI…", state="running")
-                        text2, err2 = transcribe_via_assemblyai(v["url"], aai_key)
-                        text, err = text2 or text, err2
-                if not text and fallback_enabled:
-                    status.update(label="Trying Whisper fallback (yt-dlp)…", state="running")
-                    text2, err2 = fetch_audio_and_transcribe_openai(v["url"], get_openai_client(), cookies_bytes=cookies_bytes)
-                    text, err = text2 or text, err2
-
+            # If Whisper path failed, PROMPT for cookies
             if not text:
-                reason = f"({err})" if err else "(no transcript)"
-                status.update(label=f"❌ Couldn’t get transcript {reason}. Skipping.", state="error")
-                save_video_row(conn, {
-                    "video_id": v["video_id"], "channel_id": channel_id, "published": v["published"],
-                    "title": v["title"], "url": v["url"], "transcript": None, "summary": None,
-                    "idea_json": None, "analyzed_at": now_utc(), "model": model_name
-                })
-                st.divider()
-                continue
+                status.update(label="❌ Whisper failed", state="error")
+                st.error(f"Whisper error: {err or 'unknown error'}")
+                with st.container(border=True):
+                    st.markdown("##### Fix it: Upload Netscape `cookies.txt`")
+                    st.caption("Export cookies from your YouTube browser (Netscape format) and upload them here. We’ll retry with cookies.")
+                    up = st.file_uploader("Upload cookies.txt", type=["txt"], key=f"cookies_{v['video_id']}")
+                    c1, c2 = st.columns([1,1])
+                    new_bytes = None
+                    if up is not None:
+                        new_bytes = up.read()
+                        st.session_state["cookies_bytes"] = new_bytes
+                        st.success("Cookies loaded. Click **Retry now** below.")
+                    with c1:
+                        if st.button("Retry now", use_container_width=True, key=f"retry_{v['video_id']}"):
+                            # Re-run with newly provided cookies
+                            cb = st.session_state.get("cookies_bytes", None)
+                            text2, err2 = transcribe_with_whisper(v["url"], client, cookies_bytes=cb)
+                            if not text2:
+                                st.error(f"Still failing with cookies: {err2 or 'unknown error'}")
+                                st.stop()
+                            else:
+                                text = text2
+                                st.success("✅ Transcription succeeded with cookies.")
+                    with c2:
+                        if st.button("Skip this video", use_container_width=True, key=f"skip_{v['video_id']}"):
+                            save_video_row(conn, {
+                                "video_id": v["video_id"], "channel_id": channel_id, "published": v["published"],
+                                "title": v["title"], "url": v["url"], "transcript": None,
+                                "summary": None, "idea_json": None, "analyzed_at": now_utc(), "model": model_name
+                            })
+                            st.info("Skipped.")
+                            st.divider()
+                            continue
+
+            # If we still don't have text (user neither retried nor uploaded), stop here
+            if not text:
+                st.stop()
 
             status.update(label="Analyzing with GPT…", state="running")
             try:
-                summary, idea_json = analyze_one_video(get_openai_client(), model_name, v["title"], text, previous_context=recent_rows + analyzed_rows)
+                summary, idea_json = analyze_one_video(client, model_name, v["title"], text, previous_context=recent_rows + analyzed_rows)
                 save_video_row(conn, {
                     "video_id": v["video_id"], "channel_id": channel_id, "published": v["published"],
                     "title": v["title"], "url": v["url"], "transcript": text,
@@ -699,43 +499,69 @@ def analyze_workflow(channel_id: str, model_name: str, fallback_enabled: bool = 
                 })
                 status.update(label="✅ Done", state="complete")
                 st.success(summary)
-
-                # Render trade cards + raw JSON
                 try:
                     idea = json.loads(idea_json)
-                    render_trade_cards(idea, title=v["title"], where="Video")
+                    render_trade_cards(idea, where="Video")
                     with st.expander("Structured trade idea (JSON)", expanded=False):
                         st.code(json.dumps(idea, indent=2))
                 except Exception:
                     st.code(idea_json)
-
-                analyzed_rows.append({
-                    "video_id": v["video_id"], "published": v["published"], "title": v["title"], "url": v["url"],
-                    "summary": summary, "idea_json": idea_json
-                })
+                analyzed_rows.append({"video_id": v["video_id"], "published": v["published"], "title": v["title"],
+                                      "url": v["url"], "summary": summary, "idea_json": idea_json})
             except Exception as e:
                 status.update(label="❌ Analysis failed", state="error")
                 st.error(str(e))
         st.divider()
 
-    # Synthesis
+    # Synthesize overall idea
     st.write("### 2) Synthesizing overall trade idea…")
     recent_rows2 = list_recent_analyses(conn, channel_id, limit=10)
     try:
         summary, idea_json = synthesize_overall(get_openai_client(), model_name, recent_rows2, analyzed_rows)
         save_snapshot(conn, channel_id, summary, idea_json, [x["video_id"] for x in analyzed_rows] or [x["video_id"] for x in recent_rows2])
         st.success(summary)
-        with st.expander("Overall plan (JSON)", expanded=True):
-            try:
-                idea = json.loads(idea_json)
-                render_trade_cards(idea, title="Overall", where="Overall")
+        try:
+            idea = json.loads(idea_json)
+            render_trade_cards(idea, where="Overall")
+            with st.expander("Overall plan (JSON)", expanded=True):
                 st.code(json.dumps(idea, indent=2))
-            except Exception:
-                st.code(idea_json)
+        except Exception:
+            st.code(idea_json)
     except Exception as e:
         st.error(f"Couldn’t synthesize overall idea: {e}")
 
-# ---------- PAGES ----------
+# ----------------- Synthesis helper -----------------
+def synthesize_overall(client: OpenAI, model_name: str, recent_rows: List[Dict], new_rows: List[Dict]) -> Tuple[str, str]:
+    ctx = []
+    merged = (new_rows + [x for x in recent_rows if x not in new_rows])[:10]
+    for r in merged:
+        try:
+            idea = json.loads(r.get("idea_json") or "{}")
+        except Exception:
+            idea = {}
+        ctx.append({
+            "title": r.get("title",""),
+            "published": r.get("published",""),
+            "summary": r.get("summary",""),
+            "idea": idea
+        })
+    prompt = "Past & new analyses to consider:\n" + json.dumps(ctx, ensure_ascii=False) + \
+             "\n\nSynthesize an UPDATED plan that reconciles conflicts. Return strict JSON with `trade_ideas`."
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role":"system","content":SYSTEM_PROMPT},
+                  {"role":"user","content":prompt}],
+        temperature=0.2,
+    )
+    content = resp.choices[0].message.content
+    try:
+        data = json.loads(content)
+    except Exception:
+        m = re.search(r"\{.*\}", content, re.S)
+        data = json.loads(m.group(0)) if m else {}
+    return data.get("short_summary",""), json.dumps(data, ensure_ascii=False)
+
+# ----------------- Pages -----------------
 def page_overview(channel_id: str):
     conn = get_db()
     st.subheader("Latest Overall Snapshots")
@@ -748,7 +574,7 @@ def page_overview(channel_id: str):
             st.write(sn["summary"])
             try:
                 idea = json.loads(sn["idea_json"])
-                render_trade_cards(idea, title="Snapshot", where="Snapshot")
+                render_trade_cards(idea, where="Snapshot")
             except Exception:
                 pass
             with st.expander("Snapshot JSON", expanded=False):
@@ -761,87 +587,32 @@ def page_overview(channel_id: str):
     st.subheader("Latest Channel Videos")
     try:
         feed = feed_latest(channel_id, limit=8)
-        known = get_known_ids(conn, channel_id)
+        known_ids = {r["video_id"] for r in list_all_analyses(conn, channel_id)}
         for v in feed:
-            mark = "🟢 NEW" if v["video_id"] not in known else "⚪ Analyzed"
+            mark = "🟢 NEW" if v["video_id"] not in known_ids else "⚪ Analyzed"
             st.write(f"{mark} — **{v['title']}**  \nPublished: {v['published']}  \n{v['url']}")
     except Exception as e:
         st.warning(f"Couldn’t read feed: {e}")
 
-def page_analyze(channel_id: str, current_model: str, fallback_enabled: bool, cookies_bytes: Optional[bytes], audio_mode: str, relay_url: Optional[str]):
-    col1, col2 = st.columns([1,1])
-    with col1:
-        if st.button("▶ Run analysis now", type="primary", use_container_width=True):
-            analyze_workflow(
-                channel_id,
-                current_model,
-                fallback_enabled,
-                cookies_bytes,
-                audio_mode=audio_mode,
-                relay_url=relay_url
-            )
-    with col2:
-        if st.button("♻ Rebuild overall idea (no new videos)", use_container_width=True):
-            client = get_openai_client()
-            if not client:
-                st.error("OpenAI client not available.")
-            else:
-                conn = get_db()
-                rows = list_recent_analyses(conn, channel_id, limit=10)
-                if not rows:
-                    st.info("No analyzed videos yet.")
-                else:
-                    try:
-                        summary, idea_json = synthesize_overall(client, current_model, rows, [])
-                        save_snapshot(conn, channel_id, summary, idea_json, [x["video_id"] for x in rows])
-                        st.success(summary)
-                        idea = json.loads(idea_json)
-                        render_trade_cards(idea, title="Overall", where="Overall")
-                        with st.expander("Overall plan (JSON)", expanded=True):
-                            st.code(json.dumps(idea, indent=2))
-                    except Exception as e:
-                        st.error(str(e))
+def page_analyze(channel_id: str, current_model: str, cookies_bytes: Optional[bytes]):
+    if st.button("▶ Run analysis now", type="primary", use_container_width=True):
+        analyze_workflow(channel_id, current_model, cookies_bytes)
 
     st.divider()
-    st.markdown("### Whisper-only (manual upload)")
-    up_col, _ = st.columns([1,1])
-    with up_col:
-        manual_url = st.text_input("YouTube URL (optional label)", value="")
-        manual_file = st.file_uploader(
-            "Upload audio/video for Whisper",
-            type=["mp3","m4a","mp4","webm","wav","ogg","mkv","mov"],
-            accept_multiple_files=False
-        )
-        if st.button("Transcribe & Analyze (Whisper)", use_container_width=True, disabled=manual_file is None):
-            client = get_openai_client()
-            if not client:
-                st.error("OpenAI client not available.")
-                return
-            data = manual_file.read()
-            text, err = transcribe_bytes_via_whisper(data, client, filename_hint=manual_file.name)
-            if not text:
-                st.error(f"Whisper failed: {err}")
-                return
-            # Save a synthetic video row and analyze
-            conn = get_db()
-            vid = re.search(r"v=([A-Za-z0-9_\-]+)", manual_url or "") or re.search(r"youtu\.be/([A-Za-z0-9_\-]+)", manual_url or "")
-            video_id = (vid.group(1) if vid else f"upload-{int(time.time())}")
-            title = f"Manual upload — {manual_file.name}"
-            url = manual_url or "(manual upload)"
-            try:
-                summary, idea_json = analyze_one_video(client, current_model, title, text, previous_context=list_recent_analyses(conn, channel_id, limit=10))
-                save_video_row(conn, {
-                    "video_id": video_id, "channel_id": channel_id, "published": now_utc(),
-                    "title": title, "url": url, "transcript": text,
-                    "summary": summary, "idea_json": idea_json, "analyzed_at": now_utc(), "model": current_model
-                })
-                st.success("Transcribed & analyzed with Whisper.")
-                idea = json.loads(idea_json)
-                render_trade_cards(idea, title=title, where="Manual")
-                with st.expander("Structured trade idea (JSON)", expanded=False):
-                    st.code(json.dumps(idea, indent=2))
-            except Exception as e:
-                st.error(str(e))
+    st.markdown("### Cookies (optional)")
+    st.caption("You don’t need cookies unless Whisper fails. If it fails, you’ll be prompted here too.")
+    up = st.file_uploader("Upload Netscape cookies.txt (optional)", type=["txt"], key="cookies_manual")
+    cc1, cc2 = st.columns([1,1])
+    if up is not None:
+        st.session_state["cookies_bytes"] = up.read()
+        st.success("Cookies loaded. Click **Run analysis now** again if needed.")
+    with cc1:
+        if st.button("Clear loaded cookies", use_container_width=True):
+            st.session_state.pop("cookies_bytes", None)
+            st.success("Cleared cookies from session.")
+            st.rerun()
+    with cc2:
+        st.write("")
 
 def page_history(channel_id: str):
     conn = get_db()
@@ -855,142 +626,81 @@ def page_history(channel_id: str):
             if r["idea_json"]:
                 try:
                     idea = json.loads(r["idea_json"])
-                    render_trade_cards(idea, title=r["title"], where="History")
+                    render_trade_cards(idea, where="History")
                 except Exception:
                     st.code(r["idea_json"])
 
 def page_maintenance():
-    st.info("Use these with care — this affects the whole app on this host.")
-    c1, c2, c3, c4 = st.columns(4)
+    st.info("Use with care.")
+    c1, c2 = st.columns(2)
     with c1:
         if st.button("Clear session (this tab)", use_container_width=True):
             st.session_state.clear()
             st.success("Session cleared. Rerunning…")
             st.rerun()
     with c2:
-        if st.button("Clear caches", use_container_width=True):
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.success("Caches cleared. Rerun the app.")
-            st.stop()
-    with c3:
-        if st.button("🧨 Soft wipe (keep DB file)", use_container_width=True):
+        if st.button("🧨 Wipe database & caches", use_container_width=True):
             wipe_db_tables()
-            st.success("All videos & snapshots removed from DB.")
-            st.rerun()
-    with c4:
-        pass
+            st.cache_data.clear()
+            st.success("DB tables wiped. (File kept.)")
 
     st.divider()
-    st.error("☠ Hard reset: delete DB file and restart")
+    st.error("☠ Delete DB file and restart (hard reset)")
     confirm = st.text_input("Type DELETE to confirm", value="")
     if st.button("Delete DB & restart", type="secondary", disabled=(confirm.strip().upper()!="DELETE")):
         nuke_everything()
 
-# ---------- UI / NAV ----------
+# ----------------- Main -----------------
 def main():
-    st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
-    st.title("📈 Justin Bennett Video Trading Tool")
-    st.caption("Auto-summarize videos and produce structured trade ideas. Stores history and updates ideas on next run.")
-    with st.expander("Disclaimer", expanded=False):
-        st.write("This app is for **informational and educational purposes only** and is **not financial advice**. Markets involve risk.")
+    st.set_page_config(page_title=APP_NAME, page_icon="🎧", layout="wide")
+    st.title("🎧 Whisper-Only — Justin Bennett Video Analyzer")
+    st.caption("Transcribes with OpenAI Whisper only. If it fails, you’ll be prompted to upload YouTube cookies.")
 
-    # Sidebar — core settings
+    # Sidebar
     st.sidebar.header("Settings")
-    channel_id = st.sidebar.text_input("YouTube Channel ID", value=DEFAULT_CHANNEL_ID, help="Default: Daily Price Action (@JustinBennettfx)")
-
-    # Model in session_state
+    channel_id = st.sidebar.text_input("YouTube Channel ID", value=DEFAULT_CHANNEL_ID)
     if "current_model" not in st.session_state:
         st.session_state["current_model"] = DEFAULT_MODEL
-    current_model = st.sidebar.text_input("OpenAI model", value=st.session_state["current_model"], help="e.g., gpt-4o-mini")
+    current_model = st.sidebar.text_input("OpenAI model for analysis", value=st.session_state["current_model"], help="e.g., gpt-4o-mini")
     st.session_state["current_model"] = current_model
 
-    # Transcription options (Auto mode chain)
-    st.sidebar.subheader("Auto Fallbacks")
-    fallback_enabled = st.sidebar.checkbox(
-        "Use automatic fallbacks if captions missing",
-        value=True,
-        help="Tries AssemblyAI first (URL-based), then Whisper via yt-dlp (+ optional cookies)."
-    )
-
-    # Whisper-only modes
-    st.sidebar.subheader("Whisper-only modes")
-    audio_mode = st.sidebar.selectbox(
-        "Transcription engine",
-        [
-            "Auto (Captions → AssemblyAI → Whisper)",
-            "Whisper via Relay (recommended on Cloud)",
-            "Whisper via Manual Upload",
-        ],
-        index=0,
-        help="Choose Whisper-only modes if captions/AAI should be skipped for feed analysis."
-    )
-    relay_url = st.sidebar.text_input(
-        "Audio Relay URL (for Whisper via Relay)",
-        value=st.secrets.get("AUDIO_RELAY_URL", os.getenv("AUDIO_RELAY_URL", "")),
-        placeholder="https://your-relay.onrender.com"
-    )
-
-    # Optional cookies
-    cookies_bytes = None
-    cookies_secret = st.secrets.get("YTDLP_COOKIES", None)
-    if cookies_secret:
-        cookies_bytes = cookies_secret.encode("utf-8")
-    cookie_file = st.sidebar.file_uploader("YouTube cookies.txt (optional)", type=["txt"])
-    if cookie_file:
-        cookies_bytes = cookie_file.read()
-
-    # Status
-    api_present = bool(pick_env("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None))
-    aai_present = bool(st.secrets.get("ASSEMBLYAI_API_KEY") or os.getenv("ASSEMBLYAI_API_KEY"))
+    api_present = bool(os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None))
     st.sidebar.write(f"OpenAI Key: {'✅ set' if api_present else '❌ missing'}")
-    st.sidebar.write(f"AssemblyAI Key: {'✅ set' if aai_present else '❌ missing'}")
     st.sidebar.write(f"DB file: `{DB_PATH}`")
 
-    # --- Top Menu Button + Panel ---
+    # Show cookies status
+    has_cookies = "cookies_bytes" in st.session_state and st.session_state["cookies_bytes"]
+    st.sidebar.write(f"Cookies loaded: {'✅' if has_cookies else '—'}")
+
+    # Menu
     if "page" not in st.session_state:
         st.session_state["page"] = "overview"
-    if "menu_open" not in st.session_state:
-        st.session_state["menu_open"] = False
-
-    top = st.columns([0.75, 0.25])
+    top = st.columns([0.7, 0.3])
     with top[1]:
         if st.button("☰ Menu", use_container_width=True):
-            st.session_state["menu_open"] = not st.session_state["menu_open"]
+            st.session_state["menu_open"] = not st.session_state.get("menu_open", False)
             st.rerun()
-
-    if st.session_state["menu_open"]:
+    if st.session_state.get("menu_open", False):
         with st.container(border=True):
-            st.markdown("### Navigate")
-            c1, c2, c3, c4, c5 = st.columns(5)
-            if c1.button("Overview", use_container_width=True):
-                st.session_state["page"] = "overview"; st.session_state["menu_open"] = False; st.rerun()
-            if c2.button("Analyze", use_container_width=True):
-                st.session_state["page"] = "analyze"; st.session_state["menu_open"] = False; st.rerun()
-            if c3.button("History", use_container_width=True):
-                st.session_state["page"] = "history"; st.session_state["menu_open"] = False; st.rerun()
-            if c4.button("Maintenance", use_container_width=True):
-                st.session_state["page"] = "maintenance"; st.session_state["menu_open"] = False; st.rerun()
-            if c5.button("🗑 Clear ALL Data", use_container_width=True):
-                st.session_state["page"] = "maintenance"; st.session_state["menu_open"] = False
-                st.session_state["auto_open_hard_reset"] = True
-                st.rerun()
+            c1, c2, c3, c4 = st.columns(4)
+            if c1.button("Overview", use_container_width=True): st.session_state["page"]="overview"; st.session_state["menu_open"]=False; st.rerun()
+            if c2.button("Analyze", use_container_width=True): st.session_state["page"]="analyze"; st.session_state["menu_open"]=False; st.rerun()
+            if c3.button("History", use_container_width=True): st.session_state["page"]="history"; st.session_state["menu_open"]=False; st.rerun()
+            if c4.button("Maintenance", use_container_width=True): st.session_state["page"]="maintenance"; st.session_state["menu_open"]=False; st.rerun()
         st.divider()
 
-    # --- Render selected page ---
+    # Current cookies (for workflow)
+    cookies_bytes = st.session_state.get("cookies_bytes", None)
+
+    # Render page
     page = st.session_state["page"]
     if page == "overview":
         page_overview(channel_id)
     elif page == "analyze":
-        page_analyze(channel_id, current_model, fallback_enabled, cookies_bytes, audio_mode, relay_url)
+        page_analyze(channel_id, current_model, cookies_bytes)
     elif page == "history":
         page_history(channel_id)
     elif page == "maintenance":
-        if st.session_state.pop("auto_open_hard_reset", False):
-            st.error("☠ Hard reset: delete DB file and restart")
-            confirm = st.text_input("Type DELETE to confirm", key="confirm_delete_menu")
-            if st.button("Delete DB & restart (from Menu)", type="secondary", disabled=(st.session_state.get("confirm_delete_menu","").strip().upper()!="DELETE")):
-                nuke_everything()
         page_maintenance()
     else:
         page_overview(channel_id)
