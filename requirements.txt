@@ -4,3 +4,4 @@ openai
 yt-dlp
 yfinance
 plotly
+requests
