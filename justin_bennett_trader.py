@@ -1,12 +1,17 @@
 # justin_bennett_trader.py
-# Minimal, professional UI — Whisper-only transcription
+# Minimal, pro UI — Whisper-only transcription, fully automatic.
 # Features:
-#   • Pulls Justin Bennett channel feed
-#   • Transcribes with OpenAI Whisper ONLY (yt-dlp for audio; prompts for cookies if needed)
-#   • Analyzes via OpenAI (structured trade ideas)
-#   • Shows a LIVE chart next to every trade idea/snapshot (with entry/SL/TP overlays when present)
+#   • Pulls Justin Bennett channel feed (YouTube RSS)
+#   • Transcribes ONLY with OpenAI Whisper
+#   • Robust auto-flow (no prompts):
+#        1) yt-dlp direct
+#        2) audio relay (if AUDIO_RELAY_URL is set in secrets)
+#        3) yt-dlp with cookies from secrets (YTDLP_COOKIES)
+#   • Analyses via OpenAI into structured trade ideas
+#   • Live interactive candlestick chart beside each idea/snapshot
+#     - Zoom, pan, and global timeframe (sidebar)
 #   • History view
-#   • One-click "Clear ALL Data" in sidebar (deletes DB, caches, and session)
+#   • One-click “Clear ALL Data” (DB + caches + session)
 
 import os, re, json, sqlite3, tempfile, datetime as dt, threading, time
 from typing import List, Dict, Optional, Tuple
@@ -16,9 +21,10 @@ import feedparser
 from openai import OpenAI
 import yfinance as yf
 import plotly.graph_objects as go
+import requests
 
 # ----------------- App basics -----------------
-APP_NAME = "Justin Bennett — Whisper-Only Analyzer"
+APP_NAME = "Justin Bennett — Whisper Analyzer"
 DEFAULT_CHANNEL_ID = "UCaWQprRy3TgktPvsyBLUNxw"   # Daily Price Action
 DEFAULT_MODEL = os.getenv("JB_OPENAI_MODEL", "gpt-4o-mini")  # for analysis (not transcription)
 
@@ -207,7 +213,7 @@ def feed_latest(channel_id: str, limit: int = 10) -> List[Dict]:
     items.sort(key=lambda x: x.get("published",""), reverse=True)
     return items
 
-# ----------------- Whisper-only transcription -----------------
+# ----------------- Whisper-only transcription (auto) -----------------
 _YTDLP = None
 def _lazy_import_ytdlp():
     global _YTDLP
@@ -215,8 +221,8 @@ def _lazy_import_ytdlp():
         import yt_dlp as _YTDLP  # lazy import
     return _YTDLP
 
-def transcribe_with_whisper(video_url: str, client: OpenAI, cookies_bytes: Optional[bytes] = None) -> Tuple[Optional[str], Optional[str]]:
-    """Download audio with yt-dlp (optionally with cookies) then send to OpenAI whisper-1."""
+def _transcribe_local(video_url: str, client: OpenAI, cookies_bytes: Optional[bytes]) -> Tuple[Optional[str], Optional[str]]:
+    """Try yt-dlp locally (Streamlit Cloud machine), optionally with cookies."""
     try:
         ydlp = _lazy_import_ytdlp()
         tmpdir = tempfile.mkdtemp(prefix="jb_audio_")
@@ -226,7 +232,6 @@ def transcribe_with_whisper(video_url: str, client: OpenAI, cookies_bytes: Optio
             cookiefile = os.path.join(tmpdir, "cookies.txt")
             with open(cookiefile, "wb") as cf:
                 cf.write(cookies_bytes)
-
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": outtmpl,
@@ -243,18 +248,14 @@ def transcribe_with_whisper(video_url: str, client: OpenAI, cookies_bytes: Optio
         }
         if cookiefile:
             ydl_opts["cookiefile"] = cookiefile
-
         with ydlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
             filepath = ydl.prepare_filename(info)
-
         try:
             with open(filepath, "rb") as f:
                 r = client.audio.transcriptions.create(model="whisper-1", file=f)
                 text = (r.text or "").strip()
-            if not text:
-                return None, "Whisper returned empty text"
-            return text, None
+            return (text if text else None, "empty whisper text" if not text else None)
         finally:
             try:
                 for fn in os.listdir(tmpdir):
@@ -263,7 +264,62 @@ def transcribe_with_whisper(video_url: str, client: OpenAI, cookies_bytes: Optio
                 os.rmdir(tmpdir)
             except: pass
     except Exception as e:
-        return None, f"Whisper download/transcription failed: {e}"
+        return None, f"local yt-dlp+whisper failed: {e}"
+
+def _transcribe_via_relay(video_url: str, client: OpenAI, relay_url: str, cookies_text: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Ask external relay to fetch audio, then send bytes to whisper."""
+    try:
+        url = relay_url.rstrip("/") + "/fetch"
+        payload = {"url": video_url}
+        if cookies_text:
+            payload["cookies"] = cookies_text
+        r = requests.post(url, json=payload, timeout=180)
+        if r.status_code != 200:
+            return None, f"relay HTTP {r.status_code}: {r.text[:200]}"
+        data = r.content
+        # temp file -> whisper
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            p = tmp.name
+        try:
+            with open(p, "rb") as f:
+                resp = client.audio.transcriptions.create(model="whisper-1", file=f)
+            text = (resp.text or "").strip()
+            return (text if text else None, "relay whisper empty" if not text else None)
+        finally:
+            try: os.remove(p)
+            except: pass
+    except Exception as e:
+        return None, f"relay failed: {e}"
+
+def transcribe_auto_whisper(video_url: str, client: OpenAI) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Automatic Whisper flow (no UI):
+      1) Local yt-dlp without cookies
+      2) Relay (if AUDIO_RELAY_URL provided)
+      3) Local yt-dlp with cookies from secrets (YTDLP_COOKIES)
+    """
+    # 1) local without cookies
+    text, err = _transcribe_local(video_url, client, cookies_bytes=None)
+    if text: return text, None
+
+    # 2) relay
+    relay_url = st.secrets.get("AUDIO_RELAY_URL", os.getenv("AUDIO_RELAY_URL", "")).strip()
+    cookies_secret = st.secrets.get("YTDLP_COOKIES", None)
+    cookies_text = cookies_secret if (cookies_secret and cookies_secret.strip()) else None
+    if relay_url:
+        text2, err2 = _transcribe_via_relay(video_url, client, relay_url, cookies_text)
+        if text2: return text2, None
+        err = f"{err} | {err2}"
+
+    # 3) local with cookies (if any)
+    if cookies_text:
+        text3, err3 = _transcribe_local(video_url, client, cookies_bytes=cookies_text.encode("utf-8"))
+        if text3: return text3, None
+        err = f"{err} | {err3}"
+
+    return None, err or "transcription failed"
 
 # ----------------- Analysis prompt -----------------
 SYSTEM_PROMPT = """You are a trading analyst summarizing Justin Bennett (Daily Price Action) videos.
@@ -317,64 +373,65 @@ def analyze_one_video(client: OpenAI, model_name: str, title: str, transcript: s
 # ----------------- Prices & Charts -----------------
 def _candidates_for_instrument(inst: str) -> List[str]:
     inst = (inst or "").upper().replace("/", "")
+    # common aliases
+    alias = {
+        "GOLD":"XAUUSD", "XAU":"XAUUSD",
+        "SILVER":"XAGUSD", "XAG":"XAGUSD",
+        "SPX":"^GSPC", "S&P500":"^GSPC",
+        "USOIL":"CL=F", "WTI":"CL=F", "BRENT":"BZ=F", "XTIUSD":"CL=F",
+        "DOLLARINDEX":"^DXY", "USDINDEX":"^DXY"
+    }
+    inst = alias.get(inst, inst)
     cands = []
     if re.fullmatch(r"[A-Z]{3}[A-Z]{3}", inst):  # FX like EURUSD
         cands.append(f"{inst}=X")
     if inst.endswith("USD") and len(inst) in (6,7):  # Crypto like BTCUSD
         cands.append(f"{inst[:-3]}-USD")
-    if inst in ("DXY", "USDIDX", "USDX"):
+    if inst in ("DXY", "^DXY", "USDIDX", "USDX"):
         cands.extend(["^DXY", "DX-Y.NYB"])
-    if inst in ("XAUUSD","GOLD","XAU"):
+    if inst in ("XAUUSD","GC=F"):
         cands.extend(["XAUUSD=X", "GC=F"])
-    if inst in ("SPX","SPY","S&P500","GSPC"):
+    if inst in ("XAGUSD","SI=F"):
+        cands.extend(["XAGUSD=X", "SI=F"])
+    if inst in ("CL=F", "BZ=F"):
+        cands.append(inst)
+    if inst in ("^GSPC","SPY"):
         cands.extend(["^GSPC","SPY"])
     cands.append(inst)  # fallback
+    # dedupe
     return list(dict.fromkeys(cands))
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_live_price(inst: str) -> Tuple[Optional[float], Optional[str]]:
-    for t in _candidates_for_instrument(inst):
-        try:
-            ti = yf.Ticker(t)
-            fi = getattr(ti, "fast_info", None)
-            if fi and getattr(fi, "last_price", None):
-                return float(fi.last_price), t
-            hist = ti.history(period="1d", interval="1m")
-            if not hist.empty:
-                return float(hist["Close"].iloc[-1]), t
-            hist = ti.history(period="1d")
-            if not hist.empty:
-                return float(hist["Close"].iloc[-1]), t
-        except Exception:
-            continue
-    return None, None
+# global timeframe/interval mapping
+TIMEFRAME_MAP = {
+    "1D":  ("1d",  "5m"),
+    "5D":  ("5d",  "15m"),
+    "1M":  ("1mo", "30m"),
+    "3M":  ("3mo", "60m"),
+    "6M":  ("6mo", "1d"),
+    "1Y":  ("1y",  "1d"),
+}
 
-@st.cache_data(ttl=300, show_spinner=False)
-def get_chart_data(inst: str):
+@st.cache_data(ttl=90, show_spinner=False)
+def get_chart_data(inst: str, period: str, interval: str):
     """Returns (df, used_ticker)."""
     for t in _candidates_for_instrument(inst):
         try:
             ti = yf.Ticker(t)
-            df = ti.history(period="3mo", interval="1h")
-            if df is None or df.empty:
-                df = ti.history(period="6mo", interval="1d")
+            df = ti.history(period=period, interval=interval)
             if df is not None and not df.empty:
-                df = df.dropna()
-                return df, t
+                return df.dropna(), t
         except Exception:
             continue
     return None, None
 
-def _fmt_level(x):
-    if x is None: return "—"
-    if isinstance(x, (int,float)): return f"{x:.5f}".rstrip("0").rstrip(".")
-    return str(x)
-
-def plot_live_chart(instrument: str, entries=None, sl=None, tps=None):
-    """Candlestick chart with optional horizontal lines for entries/SL/TPs."""
-    df, used = get_chart_data(instrument)
+def plot_live_chart(instrument: str, period: str, interval: str):
+    """Interactive candlestick (zoom/pan) with plotly."""
+    if not instrument:
+        st.info("No instrument specified.")
+        return
+    df, used = get_chart_data(instrument, period, interval)
     if df is None or df.empty:
-        st.info("Chart data unavailable.")
+        st.info("Chart data unavailable for this instrument.")
         return
     fig = go.Figure(data=[
         go.Candlestick(
@@ -382,32 +439,9 @@ def plot_live_chart(instrument: str, entries=None, sl=None, tps=None):
             increasing_line_color="#06c167", decreasing_line_color="#d94f4f", name=used or instrument
         )
     ])
-    # Overlay levels
-    shapes = []
-    annos = []
-    def add_hline(y, color, name):
-        if y is None: return
-        try: yval = float(y)
-        except: return
-        shapes.append(dict(type="line", xref="x", x0=df.index[0], x1=df.index[-1],
-                           yref="y", y0=yval, y1=yval, line=dict(color=color, width=1.5, dash="dot")))
-        annos.append(dict(x=df.index[-1], y=yval, xref="x", yref="y",
-                          xanchor="left", text=name, showarrow=False, font=dict(color=color, size=10)))
-    # entries
-    for e in (entries or []):
-        add_hline(e.get("level"), "#3b82f6", f"Entry ({e.get('type','')}) {_fmt_level(e.get('level'))}")
-    # SL
-    if sl and isinstance(sl, dict):
-        add_hline(sl.get("level"), "#ef4444", f"SL {_fmt_level(sl.get('level'))}")
-    # TPs
-    for t in (tps or []):
-        add_hline(t.get("level"), "#10b981", f"{t.get('label','TP')}: {_fmt_level(t.get('level'))}")
-
     fig.update_layout(
         margin=dict(l=8, r=8, t=24, b=8),
-        height=360,
-        shapes=shapes,
-        annotations=annos,
+        height=380,
         xaxis=dict(title=None, rangeslider=dict(visible=False)),
         yaxis=dict(title=None),
         showlegend=False,
@@ -423,40 +457,25 @@ def _normalize_trade_ideas(idea: Dict) -> List[Dict]:
     ti = idea.get("trade_idea")
     return [ti] if isinstance(ti, dict) else []
 
-def render_trade_cards(idea: Dict, where: str = "Video"):
+def render_trade_cards_with_charts(idea: Dict, where: str, chart_period: str, chart_interval: str):
     trades = _normalize_trade_ideas(idea)
     if not trades:
         st.info("No structured trade ideas found.")
         return
     for i, tr in enumerate(trades, 1):
         instrument = (tr.get("instrument") or "").upper()
-        price, used = (None, None)
-        if instrument: price, used = get_live_price(instrument)
         colL, colR = st.columns([1.2, 2.0], vertical_alignment="top")
         with colL:
             with st.container(border=True):
-                hdr = f"**{where} Trade {i} — {instrument or '—'}**"
-                if price is not None: hdr += f"  |  Live: `{_fmt_level(price)}` ({used})"
-                st.markdown(hdr)
-                st.markdown(f"**Bias:** {tr.get('bias','—')}  \n**TF:** {tr.get('timeframe','—')}")
-                st.markdown(f"**Plan:** {tr.get('plan','—')}")
-                if tr.get("entries"):
-                    st.markdown("**Entries:**")
-                    for e in tr["entries"]:
-                        st.markdown(f"- {e.get('type','entry')} @ `{_fmt_level(e.get('level'))}` — {e.get('condition','')}")
-                sl = tr.get("stop_loss") or {}
-                tps = tr.get("take_profits") or []
-                st.markdown("**Stop Loss:** " + (f"`{_fmt_level(sl.get('level'))}`" if sl else "—"))
-                if tps:
-                    st.markdown("**Take Profits:**")
-                    for t in tps:
-                        st.markdown(f"- {t.get('label','TP')}: `{_fmt_level(t.get('level'))}`")
+                st.markdown(f"**{where} Trade {i} — {instrument or '—'}**")
+                st.markdown(f"**Bias:** {tr.get('bias','—')} • **TF:** {tr.get('timeframe','—')}")
+                st.write(tr.get("plan",""))
         with colR:
-            plot_live_chart(instrument, tr.get("entries"), tr.get("stop_loss"), tr.get("take_profits"))
+            plot_live_chart(instrument, chart_period, chart_interval)
         st.divider()
 
 # ----------------- Workflow -----------------
-def analyze_workflow(channel_id: str, model_name: str, cookies_bytes: Optional[bytes] = None, first_run_take: int = 3):
+def analyze_workflow(channel_id: str, model_name: str, chart_period: str, chart_interval: str, first_run_take: int = 3):
     conn = get_db()
     client = get_openai_client()
     if not client:
@@ -477,37 +496,12 @@ def analyze_workflow(channel_id: str, model_name: str, cookies_bytes: Optional[b
 
     for v in targets:
         with st.status(f"Transcribing: {v['title']}", expanded=False) as status:
-            text, err = transcribe_with_whisper(v["url"], client, cookies_bytes=cookies_bytes)
-
-            # If Whisper path failed, PROMPT for cookies
+            text, err = transcribe_auto_whisper(v["url"], client)
             if not text:
                 status.update(label="Transcription failed", state="error")
-                st.error(f"Whisper error: {err or 'unknown error'}")
-                box = st.container(border=True)
-                with box:
-                    st.markdown("##### Upload Netscape `cookies.txt` to fix YouTube access")
-                    up = st.file_uploader("Upload cookies.txt", type=["txt"], key=f"cookies_{v['video_id']}")
-                    c1, c2 = st.columns([1,1])
-                    if up is not None:
-                        st.session_state["cookies_bytes"] = up.read()
-                        st.success("Cookies loaded.")
-                    if c1.button("Retry now", use_container_width=True, key=f"retry_{v['video_id']}"):
-                        cb = st.session_state.get("cookies_bytes", None)
-                        text2, err2 = transcribe_with_whisper(v["url"], client, cookies_bytes=cb)
-                        if not text2:
-                            st.error(f"Still failing with cookies: {err2 or 'unknown error'}")
-                            st.stop()
-                        text = text2
-                    if c2.button("Skip", use_container_width=True, key=f"skip_{v['video_id']}"):
-                        save_video_row(conn, {
-                            "video_id": v["video_id"], "channel_id": channel_id, "published": v["published"],
-                            "title": v["title"], "url": v["url"], "transcript": None,
-                            "summary": None, "idea_json": None, "analyzed_at": now_utc(), "model": model_name
-                        })
-                        continue
-
-            if not text:
-                st.stop()
+                st.error(f"{v['title']} — {err}")
+                # Skip silently; we continue with others
+                continue
 
             status.update(label="Analyzing…", state="running")
             try:
@@ -519,10 +513,9 @@ def analyze_workflow(channel_id: str, model_name: str, cookies_bytes: Optional[b
                     "analyzed_at": now_utc(), "model": model_name
                 })
                 status.update(label="Done", state="complete")
-                st.success(v["title"])
                 try:
                     idea = json.loads(idea_json)
-                    render_trade_cards(idea, where="Video")
+                    render_trade_cards_with_charts(idea, where="Video", chart_period=chart_period, chart_interval=chart_interval)
                 except Exception:
                     st.code(idea_json)
                 analyzed_rows.append({"video_id": v["video_id"], "published": v["published"], "title": v["title"],
@@ -532,7 +525,8 @@ def analyze_workflow(channel_id: str, model_name: str, cookies_bytes: Optional[b
                 st.error(str(e))
 
     # Snapshot synthesis
-    if analyzed_rows or recent_rows:
+    rows_for_snapshot = analyzed_rows or recent_rows
+    if rows_for_snapshot:
         try:
             summary, idea_json = synthesize_overall(get_openai_client(), model_name, recent_rows, analyzed_rows)
             save_snapshot(conn, channel_id, summary, idea_json, [x["video_id"] for x in analyzed_rows] or [x["video_id"] for x in recent_rows])
@@ -540,7 +534,7 @@ def analyze_workflow(channel_id: str, model_name: str, cookies_bytes: Optional[b
             st.success(summary)
             try:
                 idea = json.loads(idea_json)
-                render_trade_cards(idea, where="Overall")
+                render_trade_cards_with_charts(idea, where="Overall", chart_period=chart_period, chart_interval=chart_interval)
             except Exception:
                 st.code(idea_json)
         except Exception as e:
@@ -578,7 +572,7 @@ def synthesize_overall(client: OpenAI, model_name: str, recent_rows: List[Dict],
     return data.get("short_summary",""), json.dumps(data, ensure_ascii=False)
 
 # ----------------- Pages -----------------
-def page_dashboard(channel_id: str):
+def page_dashboard(channel_id: str, chart_period: str, chart_interval: str):
     conn = get_db()
     snaps = list_snapshots(conn, channel_id, limit=1)
     st.subheader("Latest Snapshot")
@@ -590,7 +584,7 @@ def page_dashboard(channel_id: str):
         st.write(sn["summary"])
         try:
             idea = json.loads(sn["idea_json"])
-            render_trade_cards(idea, where="Snapshot")
+            render_trade_cards_with_charts(idea, where="Snapshot", chart_period=chart_period, chart_interval=chart_interval)
         except Exception:
             st.code(sn["idea_json"])
 
@@ -602,36 +596,26 @@ def page_dashboard(channel_id: str):
         for r in rows:
             with st.expander(r["title"], expanded=False):
                 st.write(r["url"])
-                if r["summary"]:
-                    st.success(r["summary"])
                 try:
                     idea = json.loads(r["idea_json"])
-                    render_trade_cards(idea, where="Video")
+                    render_trade_cards_with_charts(idea, where="Video", chart_period=chart_period, chart_interval=chart_interval)
                 except Exception:
                     st.code(r["idea_json"])
 
-def page_analyze(channel_id: str, current_model: str, cookies_bytes: Optional[bytes]):
-    st.button("Analyze latest videos", type="primary", use_container_width=True, on_click=lambda: analyze_workflow(channel_id, current_model, cookies_bytes))
+def page_analyze(channel_id: str, current_model: str, chart_period: str, chart_interval: str):
+    st.button("Analyze latest videos", type="primary", use_container_width=True,
+              on_click=lambda: analyze_workflow(channel_id, current_model, chart_period, chart_interval))
 
-    st.caption("If transcription fails, you'll be prompted to upload cookies and retry.")
-    # Optional manual preload of cookies:
-    up = st.file_uploader("Upload cookies.txt (optional)", type=["txt"])
-    if up is not None:
-        st.session_state["cookies_bytes"] = up.read()
-        st.success("Cookies loaded for this session.")
-
-def page_history(channel_id: str):
+def page_history(channel_id: str, chart_period: str, chart_interval: str):
     conn = get_db()
     rows = list_all_analyses(conn, channel_id)
     st.subheader(f"History ({len(rows)} videos)")
     for r in rows:
         with st.expander(f"{r['published']} — {r['title']}", expanded=False):
             st.write(r["url"])
-            if r["summary"]:
-                st.success(r["summary"])
             try:
                 idea = json.loads(r["idea_json"])
-                render_trade_cards(idea, where="History")
+                render_trade_cards_with_charts(idea, where="History", chart_period=chart_period, chart_interval=chart_interval)
             except Exception:
                 st.code(r["idea_json"])
 
@@ -639,7 +623,7 @@ def page_history(channel_id: str):
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
 
-    # Sidebar — minimal & practical
+    # Sidebar — minimal controls
     st.sidebar.title("Settings")
     channel_id = st.sidebar.text_input("YouTube Channel ID", value=DEFAULT_CHANNEL_ID)
     if "current_model" not in st.session_state:
@@ -647,20 +631,23 @@ def main():
     current_model = st.sidebar.text_input("Model for analysis", value=st.session_state["current_model"])
     st.session_state["current_model"] = current_model
 
-    # One-click hard reset (requested)
+    # Global chart timeframe (applies to all charts)
+    tf_label = st.sidebar.selectbox("Chart timeframe", list(TIMEFRAME_MAP.keys()), index=2)  # default 1M
+    chart_period, chart_interval = TIMEFRAME_MAP[tf_label]
+
+    # One-click hard reset
     if st.sidebar.button("🗑️ Clear ALL Data", type="secondary", use_container_width=True):
         nuke_everything()
 
-    # Tabs-based navigation (clean)
-    st.title("Justin Bennett — Whisper-Only Analyzer")
+    # Tabs
+    st.title("Justin Bennett — Whisper Analyzer")
     tabs = st.tabs(["Dashboard", "Analyze", "History"])
     with tabs[0]:
-        page_dashboard(channel_id)
+        page_dashboard(channel_id, chart_period, chart_interval)
     with tabs[1]:
-        cookies_bytes = st.session_state.get("cookies_bytes", None)
-        page_analyze(channel_id, current_model, cookies_bytes)
+        page_analyze(channel_id, current_model, chart_period, chart_interval)
     with tabs[2]:
-        page_history(channel_id)
+        page_history(channel_id, chart_period, chart_interval)
 
 if __name__ == "__main__":
     main()
