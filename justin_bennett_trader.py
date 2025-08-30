@@ -8,6 +8,7 @@
 # - Stores everything in SQLite (remembers what’s analyzed; only processes new).
 # - Synthesizes an updated overall plan using recent context.
 # - Live prices per instrument, crisp trade cards with Entry / SL / TPs.
+# - NEW: Top “☰ Menu” for navigation + Maintenance page with one-click Clear ALL Data.
 #
 # ⚠ INFO/EDU ONLY — NOT FINANCIAL ADVICE.
 import os, re, json, sqlite3, tempfile, datetime as dt, threading
@@ -158,6 +159,23 @@ def list_recent_analyses(conn, channel_id: str, limit: int = 20) -> List[Dict]:
         })
     return out
 
+def list_all_analyses(conn, channel_id: str) -> List[Dict]:
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT video_id, published, title, url, summary, idea_json, analyzed_at
+      FROM videos
+      WHERE channel_id=?
+      ORDER BY published DESC
+    """, (channel_id,))
+    rows = cur.fetchall()
+    out=[]
+    for r in rows:
+        out.append({
+            "video_id": r[0], "published": r[1], "title": r[2], "url": r[3],
+            "summary": r[4], "idea_json": r[5], "analyzed_at": r[6]
+        })
+    return out
+
 def save_snapshot(conn, channel_id: str, summary: str, idea_json: str, considered_ids: List[str]):
     with DB_LOCK:
         cur = conn.cursor()
@@ -184,6 +202,37 @@ def list_snapshots(conn, channel_id: str, limit: int = 10) -> List[Dict]:
             "idea_json": r[3], "considered_video_ids": json.loads(r[4] or "[]")
         })
     return out
+
+# --- Maintenance helpers ---
+def wipe_db_tables():
+    """Soft reset: keep the file, delete all rows."""
+    conn = get_db()
+    with DB_LOCK:
+        conn.execute("DELETE FROM videos;")
+        conn.execute("DELETE FROM snapshots;")
+        conn.commit()
+
+def hard_reset_db_file():
+    """Hard reset: close cached conn, delete the DB file, recreate on next use."""
+    try:
+        conn = get_db()
+        conn.close()
+    except Exception:
+        pass
+    st.cache_resource.clear()
+    try:
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+    except Exception as e:
+        st.warning(f"Could not delete DB file: {e}")
+
+def nuke_everything():
+    """Delete DB + clear caches + clear session, then rerun fresh."""
+    hard_reset_db_file()
+    st.cache_data.clear()
+    st.session_state.clear()
+    st.success("All data and caches cleared. Rerunning…")
+    st.rerun()
 
 # ---------- Transcript ----------
 def fetch_transcript_youtube(video_id: str) -> Tuple[Optional[str], Optional[str]]:
@@ -223,7 +272,7 @@ def fetch_audio_and_transcribe_openai(video_url: str, client: "OpenAI", cookies_
             'nocheckcertificate': True,
             'geo_bypass': True,
             'geo_bypass_country': 'US',
-            # try different player client to dodge 403/age/region issues
+            # player client & headers to dodge 403/age/region issues
             'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
@@ -387,28 +436,21 @@ def synthesize_overall(client: "OpenAI", model_name: str, recent_rows: List[Dict
 def _candidates_for_instrument(inst: str) -> List[str]:
     inst = (inst or "").upper().replace("/", "")
     cands = []
-    # FX like EURUSD
-    if re.fullmatch(r"[A-Z]{3}[A-Z]{3}", inst):
+    if re.fullmatch(r"[A-Z]{3}[A-Z]{3}", inst):  # FX like EURUSD
         cands.append(f"{inst}=X")
-    # Crypto
-    if inst.endswith("USD") and len(inst) in (6,7):
+    if inst.endswith("USD") and len(inst) in (6,7):  # Crypto
         cands.append(f"{inst[:-3]}-USD")
-    # DXY
     if inst in ("DXY", "USDIDX", "USDX"):
         cands.extend(["^DXY", "DX-Y.NYB"])
-    # Gold spot
     if inst in ("XAUUSD","GOLD","XAU"):
         cands.extend(["XAUUSD=X", "GC=F"])
-    # S&P 500
     if inst in ("SPX","SPY","S&P500","GSPC"):
         cands.extend(["^GSPC","SPY"])
-    # Fallback
-    cands.append(inst)
+    cands.append(inst)  # fallback
     return list(dict.fromkeys(cands))
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_live_price(inst: str) -> Tuple[Optional[float], Optional[str]]:
-    """Return (price, ticker_used) or (None,None)."""
     for t in _candidates_for_instrument(inst):
         try:
             ti = yf.Ticker(t)
@@ -527,7 +569,7 @@ def analyze_workflow(channel_id: str, model_name: str, fallback_enabled: bool = 
             text, err = fetch_transcript_youtube(v["video_id"])
             if not text and fallback_enabled:
                 status.update(label="Captions not available. Trying Whisper fallback…", state="running")
-                text2, err2 = fetch_audio_and_transcribe_openai(v["url"], client, cookies_bytes=cookies_bytes)
+                text2, err2 = fetch_audio_and_transcribe_openai(v["url"], get_openai_client(), cookies_bytes=cookies_bytes)
                 text, err = text2, err2
 
             if not text:
@@ -546,7 +588,7 @@ def analyze_workflow(channel_id: str, model_name: str, fallback_enabled: bool = 
 
             status.update(label="Analyzing with GPT…", state="running")
             try:
-                summary, idea_json = analyze_one_video(client, model_name, v["title"], text, previous_context=recent_rows + analyzed_rows)
+                summary, idea_json = analyze_one_video(get_openai_client(), model_name, v["title"], text, previous_context=recent_rows + analyzed_rows)
                 save_video_row(conn, {
                     "video_id": v["video_id"], "channel_id": channel_id, "published": v["published"],
                     "title": v["title"], "url": v["url"], "transcript": text,
@@ -578,7 +620,7 @@ def analyze_workflow(channel_id: str, model_name: str, fallback_enabled: bool = 
     st.write("### 2) Synthesizing overall trade idea…")
     recent_rows2 = list_recent_analyses(conn, channel_id, limit=10)
     try:
-        summary, idea_json = synthesize_overall(client, model_name, recent_rows2, analyzed_rows)
+        summary, idea_json = synthesize_overall(get_openai_client(), model_name, recent_rows2, analyzed_rows)
         save_snapshot(conn, channel_id, summary, idea_json, [x["video_id"] for x in analyzed_rows] or [x["video_id"] for x in recent_rows2])
         st.success(summary)
         with st.expander("Overall plan (JSON)", expanded=True):
@@ -591,52 +633,9 @@ def analyze_workflow(channel_id: str, model_name: str, fallback_enabled: bool = 
     except Exception as e:
         st.error(f"Couldn’t synthesize overall idea: {e}")
 
-# ---------- UI ----------
-def main():
-    st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
-    st.title("📈 Justin Bennett Video Trading Tool")
-    st.caption("Auto-summarize videos and produce structured trade ideas. Stores history and updates ideas on next run.")
-    with st.expander("Disclaimer", expanded=False):
-        st.write("This app is for **informational and educational purposes only** and is **not financial advice**. Markets involve risk.")
-
-    # Sidebar
-    st.sidebar.header("Settings")
-    channel_id = st.sidebar.text_input("YouTube Channel ID", value=DEFAULT_CHANNEL_ID, help="Default: Daily Price Action (@JustinBennettfx)")
-
-    # Model stored in session_state (no globals)
-    if "current_model" not in st.session_state:
-        st.session_state["current_model"] = DEFAULT_MODEL
-    current_model = st.sidebar.text_input("OpenAI model", value=st.session_state["current_model"], help="e.g., gpt-4o-mini")
-    st.session_state["current_model"] = current_model
-
-    # Transcription options
-    st.sidebar.subheader("Transcription options")
-    fallback_enabled = st.sidebar.checkbox(
-        "Try Whisper fallback if captions missing",
-        value=True,
-        help="Downloads audio via yt-dlp and transcribes with OpenAI. If you see 403, add cookies below."
-    )
-
-    cookies_bytes = None
-    cookies_secret = st.secrets.get("YTDLP_COOKIES", None)
-    if cookies_secret:
-        cookies_bytes = cookies_secret.encode("utf-8")
-
-    cookie_file = st.sidebar.file_uploader(
-        "YouTube cookies.txt (optional)",
-        type=["txt"],
-        help="Export with a browser extension (Netscape format). Helps bypass 403/age/region limits."
-    )
-    if cookie_file:
-        cookies_bytes = cookie_file.read()
-
-    api_present = bool(pick_env("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None))
-    st.sidebar.write(f"OpenAI Key: {'✅ set' if api_present else '❌ missing'}")
-    st.sidebar.write(f"DB file: `{DB_PATH}`")
-
+# ---------- PAGES ----------
+def page_overview(channel_id: str):
     conn = get_db()
-
-    # Latest snapshots
     st.subheader("Latest Overall Snapshots")
     snaps = list_snapshots(conn, channel_id, limit=5)
     if not snaps:
@@ -657,7 +656,6 @@ def main():
                     st.code(sn["idea_json"])
             st.divider()
 
-    # Feed preview
     st.subheader("Latest Channel Videos")
     try:
         feed = feed_latest(channel_id, limit=8)
@@ -668,17 +666,18 @@ def main():
     except Exception as e:
         st.warning(f"Couldn’t read feed: {e}")
 
-    st.divider()
+def page_analyze(channel_id: str, current_model: str, fallback_enabled: bool, cookies_bytes: Optional[bytes]):
     col1, col2 = st.columns([1,1])
     with col1:
-        if st.button("▶ Run analysis now", type="primary"):
+        if st.button("▶ Run analysis now", type="primary", use_container_width=True):
             analyze_workflow(channel_id, current_model, fallback_enabled, cookies_bytes)
     with col2:
-        if st.button("♻ Rebuild overall idea (no new videos)"):
+        if st.button("♻ Rebuild overall idea (no new videos)", use_container_width=True):
             client = get_openai_client()
             if not client:
                 st.error("OpenAI client not available.")
             else:
+                conn = get_db()
                 rows = list_recent_analyses(conn, channel_id, limit=10)
                 if not rows:
                     st.info("No analyzed videos yet.")
@@ -693,6 +692,137 @@ def main():
                             st.code(json.dumps(idea, indent=2))
                     except Exception as e:
                         st.error(str(e))
+
+def page_history(channel_id: str):
+    conn = get_db()
+    rows = list_all_analyses(conn, channel_id)
+    st.write(f"Total analyzed videos: **{len(rows)}**")
+    for r in rows:
+        with st.expander(f"{r['published']} — {r['title']}", expanded=False):
+            st.write(r["url"])
+            if r["summary"]:
+                st.success(r["summary"])
+            if r["idea_json"]:
+                try:
+                    idea = json.loads(r["idea_json"])
+                    render_trade_cards(idea, title=r["title"], where="History")
+                except Exception:
+                    st.code(r["idea_json"])
+
+def page_maintenance():
+    st.info("Use these with care — this affects the whole app on this host.")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        if st.button("Clear session (this tab)", use_container_width=True):
+            st.session_state.clear()
+            st.success("Session cleared. Rerunning…")
+            st.rerun()
+    with c2:
+        if st.button("Clear caches", use_container_width=True):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.success("Caches cleared. Rerun the app.")
+            st.stop()
+    with c3:
+        if st.button("🧨 Soft wipe (keep DB file)", use_container_width=True):
+            wipe_db_tables()
+            st.success("All videos & snapshots removed from DB.")
+            st.rerun()
+    with c4:
+        pass
+
+    st.divider()
+    st.error("☠ Hard reset: delete DB file and restart")
+    confirm = st.text_input("Type DELETE to confirm", value="")
+    if st.button("Delete DB & restart", type="secondary", disabled=(confirm.strip().upper()!="DELETE")):
+        nuke_everything()
+
+# ---------- UI / NAV ----------
+def main():
+    st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
+    st.title("📈 Justin Bennett Video Trading Tool")
+    st.caption("Auto-summarize videos and produce structured trade ideas. Stores history and updates ideas on next run.")
+    with st.expander("Disclaimer", expanded=False):
+        st.write("This app is for **informational and educational purposes only** and is **not financial advice**. Markets involve risk.")
+
+    # Sidebar — core settings (kept minimal)
+    st.sidebar.header("Settings")
+    channel_id = st.sidebar.text_input("YouTube Channel ID", value=DEFAULT_CHANNEL_ID, help="Default: Daily Price Action (@JustinBennettfx)")
+
+    # Model in session_state (no globals)
+    if "current_model" not in st.session_state:
+        st.session_state["current_model"] = DEFAULT_MODEL
+    current_model = st.sidebar.text_input("OpenAI model", value=st.session_state["current_model"], help="e.g., gpt-4o-mini")
+    st.session_state["current_model"] = current_model
+
+    # Transcription options
+    st.sidebar.subheader("Transcription")
+    fallback_enabled = st.sidebar.checkbox(
+        "Whisper fallback if captions missing",
+        value=True,
+        help="Downloads audio via yt-dlp and transcribes with OpenAI. If you see 403, add cookies below."
+    )
+
+    cookies_bytes = None
+    cookies_secret = st.secrets.get("YTDLP_COOKIES", None)
+    if cookies_secret:
+        cookies_bytes = cookies_secret.encode("utf-8")
+    cookie_file = st.sidebar.file_uploader("YouTube cookies.txt (optional)", type=["txt"])
+    if cookie_file:
+        cookies_bytes = cookie_file.read()
+
+    # Status
+    api_present = bool(pick_env("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None))
+    st.sidebar.write(f"OpenAI Key: {'✅ set' if api_present else '❌ missing'}")
+    st.sidebar.write(f"DB file: `{DB_PATH}`")
+
+    # --- Top Menu Button + Panel ---
+    if "page" not in st.session_state:
+        st.session_state["page"] = "overview"
+    if "menu_open" not in st.session_state:
+        st.session_state["menu_open"] = False
+
+    top = st.columns([0.75, 0.25])
+    with top[1]:
+        if st.button("☰ Menu", use_container_width=True):
+            st.session_state["menu_open"] = not st.session_state["menu_open"]
+            st.experimental_rerun()
+
+    if st.session_state["menu_open"]:
+        with st.container(border=True):
+            st.markdown("### Navigate")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            if c1.button("Overview", use_container_width=True):
+                st.session_state["page"] = "overview"; st.session_state["menu_open"] = False; st.rerun()
+            if c2.button("Analyze", use_container_width=True):
+                st.session_state["page"] = "analyze"; st.session_state["menu_open"] = False; st.rerun()
+            if c3.button("History", use_container_width=True):
+                st.session_state["page"] = "history"; st.session_state["menu_open"] = False; st.rerun()
+            if c4.button("Maintenance", use_container_width=True):
+                st.session_state["page"] = "maintenance"; st.session_state["menu_open"] = False; st.rerun()
+            if c5.button("🗑 Clear ALL Data", use_container_width=True):
+                st.session_state["page"] = "maintenance"; st.session_state["menu_open"] = False
+                st.session_state["auto_open_hard_reset"] = True
+                st.rerun()
+        st.divider()
+
+    # --- Render selected page ---
+    page = st.session_state["page"]
+    if page == "overview":
+        page_overview(channel_id)
+    elif page == "analyze":
+        page_analyze(channel_id, current_model, fallback_enabled, cookies_bytes)
+    elif page == "history":
+        page_history(channel_id)
+    elif page == "maintenance":
+        if st.session_state.pop("auto_open_hard_reset", False):
+            st.error("☠ Hard reset: delete DB file and restart")
+            confirm = st.text_input("Type DELETE to confirm", key="confirm_delete_menu")
+            if st.button("Delete DB & restart (from Menu)", type="secondary", disabled=(st.session_state.get("confirm_delete_menu","").strip().upper()!="DELETE")):
+                nuke_everything()
+        page_maintenance()
+    else:
+        page_overview(channel_id)
 
 if __name__ == "__main__":
     main()
