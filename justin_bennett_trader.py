@@ -8,23 +8,28 @@
 # - Stores everything in SQLite (remembers what’s analyzed; only processes new).
 # - Synthesizes an updated overall plan using recent context.
 # - Live prices per instrument, crisp trade cards with Entry / SL / TPs.
-# - NEW: Top “☰ Menu” for navigation + Maintenance page with one-click Clear ALL Data.
+# - Top “☰ Menu” for navigation + Maintenance page with one-click Clear ALL Data.
 #
 # ⚠ INFO/EDU ONLY — NOT FINANCIAL ADVICE.
+
 import os, re, json, sqlite3, tempfile, datetime as dt, threading
 from typing import List, Dict, Optional, Tuple
 
 import streamlit as st
 import feedparser
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    TranscriptsDisabled,
+    NoTranscriptFound,
+    CouldNotRetrieveTranscript,
+)
 
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
-# live prices
-import yfinance as yf
+import yfinance as yf  # live prices
 
 _YTDLP = None
 
@@ -786,7 +791,7 @@ def main():
     with top[1]:
         if st.button("☰ Menu", use_container_width=True):
             st.session_state["menu_open"] = not st.session_state["menu_open"]
-            st.experimental_rerun()
+            st.rerun()
 
     if st.session_state["menu_open"]:
         with st.container(border=True):
@@ -826,3 +831,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
