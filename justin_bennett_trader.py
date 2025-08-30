@@ -1,20 +1,21 @@
-# apps/justin_bennett_trader.py
+# justin_bennett_trader.py
 # requirements: streamlit, feedparser, youtube-transcript-api, openai, yt-dlp, requests, yfinance
 #
 # Justin Bennett / Daily Price Action video analyzer:
 # - Pulls latest YouTube videos via RSS.
-# - Gets transcript (captions first; Whisper fallback with yt-dlp + optional cookies).
+# - Transcript order: (1) YouTube captions  (2) AssemblyAI (URL)  (3) Whisper via yt-dlp (+ optional cookies).
 # - Uses OpenAI to create a SHORT SUMMARY + STRUCTURED TRADE IDEA (strict JSON).
-# - Stores everything in SQLite (remembers what’s analyzed; only processes new).
-# - Synthesizes an updated overall plan using recent context.
-# - Live prices per instrument, crisp trade cards with Entry / SL / TPs.
-# - Top “☰ Menu” for navigation + Maintenance page with one-click Clear ALL Data.
+# - Stores history in SQLite (remembers analyzed items).
+# - Synthesizes an updated overall plan from recent videos.
+# - Live prices via yfinance, clean trade cards (Entries / SL / TPs).
+# - Top “☰ Menu” navigation + Maintenance page (soft wipe / hard reset).
 #
-# ⚠ INFO/EDU ONLY — NOT FINANCIAL ADVICE.
+# ⚠️ Educational use only — not financial advice.
 
-import os, re, json, sqlite3, tempfile, datetime as dt, threading
+import os, re, json, sqlite3, tempfile, datetime as dt, threading, time
 from typing import List, Dict, Optional, Tuple
 
+import requests
 import streamlit as st
 import feedparser
 from youtube_transcript_api import (
@@ -38,7 +39,7 @@ DEFAULT_CHANNEL_ID = "UCaWQprRy3TgktPvsyBLUNxw"   # Daily Price Action (@JustinB
 
 # --------- Paths / DB ---------
 BASE_DIR = os.path.dirname(__file__)
-DB_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data"))
+DB_DIR = os.path.abspath(os.path.join(BASE_DIR, "data"))   # keep DB within repo folder
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "jb_trader.db")
 
@@ -90,7 +91,7 @@ def ensure_db(conn: sqlite3.Connection):
 
 @st.cache_resource(show_spinner=False)
 def get_db():
-    # Allow use across Streamlit threads + better concurrency with WAL
+    # Allow cross-thread use; WAL improves concurrency
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -239,7 +240,7 @@ def nuke_everything():
     st.success("All data and caches cleared. Rerunning…")
     st.rerun()
 
-# ---------- Transcript ----------
+# ---------- Transcript helpers ----------
 def fetch_transcript_youtube(video_id: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         caps = YouTubeTranscriptApi.get_transcript(video_id, languages=['en','en-US','en-GB'])
@@ -312,6 +313,37 @@ def fetch_audio_and_transcribe_openai(video_url: str, client: "OpenAI", cookies_
     except Exception as e:
         return None, f"Fallback transcription failed: {e}"
 
+def transcribe_via_assemblyai(video_url: str, api_key: str, poll_s: float = 3.0, timeout_s: int = 600):
+    """
+    Ask AssemblyAI to fetch & transcribe the YouTube URL.
+    Returns (text, error) like the other helpers.
+    """
+    try:
+        headers = {"authorization": api_key, "content-type": "application/json"}
+        r = requests.post(
+            "https://api.assemblyai.com/v2/transcript",
+            json={"audio_url": video_url, "language_code": "en"},
+            headers=headers, timeout=30,
+        )
+        r.raise_for_status()
+        tid = r.json()["id"]
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            s = requests.get(f"https://api.assemblyai.com/v2/transcript/{tid}", headers=headers, timeout=30)
+            s.raise_for_status()
+            data = s.json()
+            status = data.get("status")
+            if status == "completed":
+                text = (data.get("text") or "").strip()
+                return (text if text else None, None)
+            if status == "error":
+                return None, f"AssemblyAI error: {data.get('error')}"
+            time.sleep(poll_s)
+        return None, "AssemblyAI timeout"
+    except Exception as e:
+        return None, f"AssemblyAI exception: {e}"
+
 # ---------- OpenAI ----------
 def get_openai_client() -> Optional["OpenAI"]:
     key = pick_env("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
@@ -323,7 +355,7 @@ def get_openai_client() -> Optional["OpenAI"]:
     except Exception:
         return None
 
-# Updated schema: prefer trade_ideas (array). Backwards compatible with trade_idea (single).
+# ---------- Model prompts ----------
 SYSTEM_PROMPT = """You are a trading analyst specialized in summarizing Justin Bennett (Daily Price Action) videos.
 Extract price-action ideas without hype. Prefer clarity over verbosity.
 
@@ -389,7 +421,6 @@ TRANSCRIPT (truncated if long):
     )
     content = resp.choices[0].message.content
 
-    # Parse strict/fenced JSON
     try:
         idea_json = json.loads(content)
     except Exception:
@@ -537,7 +568,7 @@ def render_trade_cards(idea: Dict, title: str = "", where: str = "Video"):
         st.caption("Risk: position sizing, slippage, news risk. Not financial advice.")
         st.divider()
 
-# ---------- Analysis orchestrators ----------
+# ---------- Analysis orchestrator ----------
 def analyze_workflow(channel_id: str, model_name: str, fallback_enabled: bool = True, cookies_bytes: Optional[bytes] = None, first_run_take: int = 3):
     conn = get_db()
     client = get_openai_client()
@@ -571,16 +602,27 @@ def analyze_workflow(channel_id: str, model_name: str, fallback_enabled: bool = 
     for i, v in enumerate(targets, start=1):
         st.write(f"#### Video {i}/{len(targets)} — {v['title']}")
         with st.status("Transcribing…", expanded=False) as status:
+            # (1) Captions
             text, err = fetch_transcript_youtube(v["video_id"])
+
+            # (2) AssemblyAI fallback (no cookies needed)
             if not text and fallback_enabled:
-                status.update(label="Captions not available. Trying Whisper fallback…", state="running")
+                aai_key = (st.secrets.get("ASSEMBLYAI_API_KEY", None) or os.getenv("ASSEMBLYAI_API_KEY"))
+                if aai_key:
+                    status.update(label="Captions missing. Trying AssemblyAI…", state="running")
+                    text2, err2 = transcribe_via_assemblyai(v["url"], aai_key)
+                    text, err = text2 or text, err2
+
+            # (3) Whisper (yt-dlp + optional cookies)
+            if not text and fallback_enabled:
+                status.update(label="Trying Whisper fallback (yt-dlp)…", state="running")
                 text2, err2 = fetch_audio_and_transcribe_openai(v["url"], get_openai_client(), cookies_bytes=cookies_bytes)
-                text, err = text2, err2
+                text, err = text2 or text, err2
 
             if not text:
                 reason = f"({err})" if err else "(no transcript)"
                 if not fallback_enabled:
-                    status.update(label=f"No captions; Whisper fallback disabled. Skipping. {reason}", state="error")
+                    status.update(label=f"No captions; Whisper/AAI fallback disabled. Skipping. {reason}", state="error")
                 else:
                     status.update(label=f"❌ Couldn’t get transcript {reason}. Skipping.", state="error")
                 save_video_row(conn, {
@@ -750,11 +792,11 @@ def main():
     with st.expander("Disclaimer", expanded=False):
         st.write("This app is for **informational and educational purposes only** and is **not financial advice**. Markets involve risk.")
 
-    # Sidebar — core settings (kept minimal)
+    # Sidebar — core settings
     st.sidebar.header("Settings")
     channel_id = st.sidebar.text_input("YouTube Channel ID", value=DEFAULT_CHANNEL_ID, help="Default: Daily Price Action (@JustinBennettfx)")
 
-    # Model in session_state (no globals)
+    # Model in session_state
     if "current_model" not in st.session_state:
         st.session_state["current_model"] = DEFAULT_MODEL
     current_model = st.sidebar.text_input("OpenAI model", value=st.session_state["current_model"], help="e.g., gpt-4o-mini")
@@ -763,9 +805,9 @@ def main():
     # Transcription options
     st.sidebar.subheader("Transcription")
     fallback_enabled = st.sidebar.checkbox(
-        "Whisper fallback if captions missing",
+        "Use automatic fallbacks if captions missing",
         value=True,
-        help="Downloads audio via yt-dlp and transcribes with OpenAI. If you see 403, add cookies below."
+        help="Tries AssemblyAI first (URL-based), then Whisper via yt-dlp (+ optional cookies)."
     )
 
     cookies_bytes = None
@@ -778,7 +820,9 @@ def main():
 
     # Status
     api_present = bool(pick_env("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None))
+    aai_present = bool(st.secrets.get("ASSEMBLYAI_API_KEY") or os.getenv("ASSEMBLYAI_API_KEY"))
     st.sidebar.write(f"OpenAI Key: {'✅ set' if api_present else '❌ missing'}")
+    st.sidebar.write(f"AssemblyAI Key: {'✅ set' if aai_present else '❌ missing'}")
     st.sidebar.write(f"DB file: `{DB_PATH}`")
 
     # --- Top Menu Button + Panel ---
@@ -831,4 +875,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
