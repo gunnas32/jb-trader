@@ -1,21 +1,12 @@
 # audio_relay.py
-# A tiny service that downloads YouTube audio with yt-dlp and returns the bytes.
-# Deploy: uvicorn audio_relay:app --host 0.0.0.0 --port $PORT
-
-import os, tempfile
+# Start: uvicorn audio_relay:app --host 0.0.0.0 --port $PORT
+import os, tempfile, yt_dlp
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import Response
 
 app = FastAPI(title="Audio Relay (yt-dlp)")
-
-_YTDLP = None
-def _lazy_import_ytdlp():
-    global _YTDLP
-    if _YTDLP is None:
-        import yt_dlp as _YTDLP
-    return _YTDLP
 
 class FetchReq(BaseModel):
     url: str
@@ -24,7 +15,6 @@ class FetchReq(BaseModel):
 @app.post("/fetch")
 def fetch(req: FetchReq):
     try:
-        ydlp = _lazy_import_ytdlp()
         tmpdir = tempfile.mkdtemp(prefix="relay_")
         outpath = os.path.join(tmpdir, "%(id)s.%(ext)s")
         cookiefile = None
@@ -32,7 +22,6 @@ def fetch(req: FetchReq):
             cookiefile = os.path.join(tmpdir, "cookies.txt")
             with open(cookiefile, "w", encoding="utf-8") as cf:
                 cf.write(req.cookies)
-
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': outpath,
@@ -49,21 +38,17 @@ def fetch(req: FetchReq):
         }
         if cookiefile:
             ydl_opts['cookiefile'] = cookiefile
-
-        with ydlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(req.url, download=True)
             path = ydl.prepare_filename(info)
-
         with open(path, "rb") as f:
             data = f.read()
-
         try:
             for fn in os.listdir(tmpdir):
                 try: os.remove(os.path.join(tmpdir, fn))
                 except: pass
             os.rmdir(tmpdir)
         except: pass
-
         return Response(content=data, media_type="application/octet-stream")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
